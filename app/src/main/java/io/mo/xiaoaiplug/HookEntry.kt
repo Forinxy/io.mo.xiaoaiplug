@@ -280,6 +280,10 @@ class HookEntry : IXposedHookLoadPackage {
 
     private val THINKING_PLACEHOLDER = "🤖 正在思考…"
 
+    // 流式显示:两次卡片刷新之间的最小间隔,免得每个 token 都 post 一次主线程把 UI 打爆。
+    private val STREAM_RENDER_INTERVAL_MS = 60L
+    @Volatile private var lastStreamRenderAt = 0L
+
     // 历史库改写:拦下小爱自己那句兜底文案,等我们的答案到了再写进去。
     // 实测一次交互里 recordToSpeak 会被连调十来次(同一句插了 11 行),所以压制按对话维度、
     // 写入用 historyWritten 保证只写一次。
@@ -1986,6 +1990,48 @@ class HookEntry : IXposedHookLoadPackage {
         return key
     }
 
+    // ── 流式显示 ──────────────────────────────────────────────────────────────
+    // 只驱动「显示」:把模型正文的增量推到这次问话名下已存在的答案卡,做打字机效果。
+    // TTS 不受影响,仍是拿到全文后整串播(speakAnswer)。当前没有卡片就静默丢弃 ——
+    // 最终答案由原有的 applyAnswer 路径兜底,流式纯属锦上添花,不承担正确性。
+    private fun streamSinkFor(key: String) = object : AiClient.StreamSink {
+        override fun onDelta(text: String) {
+            // 文本约定降级时,工具轮的 <tool_call> 残渣别上屏;节流,避免主线程被 token 刷爆。
+            if (text.isBlank() || text.contains("<tool_call")) return
+            val now = System.currentTimeMillis()
+            if (now - lastStreamRenderAt < STREAM_RENDER_INTERVAL_MS) return
+            lastStreamRenderAt = now
+            pushStreamingText(key, text)
+        }
+        override fun onComplete(text: String) {
+            // 定稿:不节流,保证卡片停在完整答案上(节流可能吞掉了最后一帧)。
+            lastStreamRenderAt = 0L
+            if (text.isNotBlank()) pushStreamingText(key, text)
+        }
+        override fun onDiscard() {
+            // 这轮是工具调用:把乐观推上去的正文撤回占位,等下一轮真答案。
+            lastStreamRenderAt = 0L
+            pushStreamingText(key, THINKING_PLACEHOLDER)
+        }
+    }
+
+    // 把文本推到这次问话名下所有活着的答案卡(自建卡 + 认领来的话术卡都算)。best-effort。
+    private fun pushStreamingText(key: String, text: String) {
+        for (id in utteranceDialogs[key].orEmpty()) {
+            val card = answerCards[id]?.get() ?: continue
+            // 登记好该显示什么,bindView 会据此强制回填,和流式保持一致。
+            ourCardTexts[System.identityHashCode(card)] = text
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    card.javaClass.getMethod("updateCardText", String::class.java).invoke(card, text)
+                    forceShowToastViewHolder(card, text)
+                } catch (t: Throwable) {
+                    // 卡片类型不支持 updateCardText 之类 —— 丢掉即可,最终答案有兜底路径。
+                }
+            }
+        }
+    }
+
     // 一次问话只调一次模型;答案回来后分发给这次问话名下的所有 dialogId。
     private fun startAiCall(key: String, queryText: String, config: AiConfig) {
         Thread {
@@ -2007,7 +2053,11 @@ class HookEntry : IXposedHookLoadPackage {
                     ChatHistory.clear()
                     emptyList()
                 }
-                val answer = AiClient.chat(config, queryText, currentApplicationContext(), history) {
+                // 流式已重开:此前工具全挂是因为 arguments/name 的 JSON null 被 optString 拼成
+                // 字面量 "null" 毁了参数(已加 isNull 防护)。带着调试日志一起放出去,真机核对。
+                val answer = AiClient.chat(
+                    config, queryText, currentApplicationContext(), history, streamSinkFor(key)
+                ) {
                     val ours = utteranceDialogs[key].orEmpty().any {
                         it in takeOver || it in pendingViewAnswer
                     }

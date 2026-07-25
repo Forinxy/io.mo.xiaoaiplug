@@ -75,6 +75,26 @@ object AiClient {
     const val FAILED_ANSWER = "(模型返回了无法解析的工具调用，没有得到答案)"
 
     /**
+     * 流式显示回调。传了它,每一轮模型调用就走 SSE 流式;不传(null)照旧整包读取。
+     *
+     * 只服务「显示」—— TTS 仍是拿到全文后整串播。工具循环一份代码通吃:流式重组出来的
+     * assistant message 和非流式版本**形状完全一致**,循环逻辑不用改。
+     *
+     * 一轮到底是「工具决策」还是「最终答案」事先并不知道。策略是乐观推正文:
+     *  - [onDelta]  流式期间反复回调,text 是本轮到目前为止的累计正文(单调增长)。
+     *  - [onComplete] 本轮确认是最终答案,text 是**清理过标记**的定稿(不受节流影响,保证末帧落地)。
+     *  - [onDiscard]  本轮其实是工具调用(或空答案),之前推上屏的正文应撤回占位。
+     *
+     * 原生 function calling 的工具轮几乎不吐正文,所以 onDelta 基本不会为工具轮触发;
+     * 只有降级到文本约定时,工具轮的 `<tool_call>` 标记可能被推出来 —— 由显示端自行拦掉。
+     */
+    interface StreamSink {
+        fun onDelta(text: String)
+        fun onComplete(text: String)
+        fun onDiscard()
+    }
+
+    /**
      * @param history 之前几轮的问答(由旧到新),拼在本轮提问前面当上下文。见 [ChatHistory]。
      * @param allowMutating 每次工具执行时求值:本轮是否确实由我们接管。
      *   false 时动作类工具(launch_app / set_setting / …)被拒绝执行。
@@ -85,6 +105,7 @@ object AiClient {
         userText: String,
         ctx: Context? = null,
         history: List<ChatTurn> = emptyList(),
+        sink: StreamSink? = null,
         allowMutating: () -> Boolean = { true }
     ): String {
         // 包一层只为埋点:chatInternal 有三个 return 点,逐个改容易漏。
@@ -94,7 +115,7 @@ object AiClient {
         // 早先只有一个总时长,只能拿 CHAT 和 TOOL 两条记录的时间戳倒推。
         val steps = ArrayList<Pair<String, Long>>()
         return try {
-            val answer = chatInternal(config, userText, ctx, history, allowMutating, steps)
+            val answer = chatInternal(config, userText, ctx, history, sink, allowMutating, steps)
             LogClient.chat(
                 ctx, userText, answer, config.effectiveModel,
                 System.currentTimeMillis() - started, formatSteps(steps)
@@ -122,6 +143,7 @@ object AiClient {
         userText: String,
         ctx: Context?,
         history: List<ChatTurn>,
+        sink: StreamSink?,
         allowMutating: () -> Boolean,
         steps: MutableList<Pair<String, Long>>
     ): String {
@@ -163,7 +185,7 @@ object AiClient {
         var lastContent = ""
         for (iter in 0 until MAX_TOOL_ITERATIONS) {
             val modelAt = System.currentTimeMillis()
-            val reply = callModel(config, messages, if (useNative) specs else emptyList(), ctx)
+            val reply = callModel(config, messages, if (useNative) specs else emptyList(), ctx, sink)
             steps.add("模型" to System.currentTimeMillis() - modelAt)
             val content = reply.optString("content", "")
             lastContent = content
@@ -176,10 +198,18 @@ object AiClient {
                 val clean = stripToolTags(content)
                 if (clean.isBlank()) {
                     Log.w(TAG, "empty answer after stripping tool markup, raw=${content.take(200)}")
+                    // 流式期间可能已经把残渣推上屏了,撤回占位。
+                    sink?.onDiscard()
                     return FAILED_ANSWER
                 }
+                // 定稿落地:清理过标记的全文,不受节流影响,保证卡片停在完整答案上。
+                sink?.onComplete(clean)
                 return clean
             }
+
+            // 这轮是工具调用,不是给用户看的答案。流式期间乐观推的正文(文本约定下可能是
+            // <tool_call> 残渣)在这里撤回,卡片回到「思考中」等下一轮真答案。
+            sink?.onDiscard()
 
             // 原样回填 assistant 这一轮(原生模式要带上 tool_calls,否则模型对不上号)
             messages.put(reply)
@@ -214,7 +244,9 @@ object AiClient {
             }
         }
         // 超过循环上限:把最后内容去掉标记后返回,避免卡死
-        return stripToolTags(lastContent).ifBlank { "(工具调用超过上限，未得到最终答案)" }
+        val capped = stripToolTags(lastContent).ifBlank { "(工具调用超过上限，未得到最终答案)" }
+        sink?.onComplete(capped)
+        return capped
     }
 
     /** 并行执行本轮所有工具,返回与 calls 同序的结果。 */
@@ -288,10 +320,11 @@ object AiClient {
         config: AiConfig,
         messages: JSONArray,
         specs: List<Tools.Spec>,
-        ctx: Context?
+        ctx: Context?,
+        sink: StreamSink?
     ): JSONObject {
         return try {
-            request(config, messages, specs)
+            request(config, messages, specs, sink)
         } catch (t: HttpError) {
             if (specs.isNotEmpty() && t.code == 400) {
                 Log.w(TAG, "endpoint rejected native tools (400), falling back to text convention: ${t.body.take(200)}")
@@ -304,7 +337,8 @@ object AiClient {
                 // 这一轮先按无工具重发;下一轮 chat() 会走文本约定并把工具表写进 prompt。
                 // 注意本轮模型看不到工具表,可能直接给个"我不知道"——可以接受,
                 // 因为降级只会发生一次,之后整个进程都走文本路。
-                request(config, messages, emptyList())
+                // 400 在流开始前就从 responseCode 拿到,此刻 sink 还没推过任何 delta,重发照常带 sink。
+                request(config, messages, emptyList(), sink)
             } else throw t
         }
     }
@@ -319,19 +353,32 @@ object AiClient {
     private fun request(
         config: AiConfig,
         messages: JSONArray,
-        specs: List<Tools.Spec>
+        specs: List<Tools.Spec>,
+        sink: StreamSink?
     ): JSONObject = when (config.aiProvider.wire) {
-        AiProvider.Wire.OPENAI -> postOpenAi(config, messages, specs)
-        AiProvider.Wire.ANTHROPIC -> postAnthropic(config, messages, specs)
+        AiProvider.Wire.OPENAI ->
+            if (sink != null) postOpenAiStream(config, messages, specs, sink)
+            else postOpenAi(config, messages, specs)
+        AiProvider.Wire.ANTHROPIC ->
+            if (sink != null) postAnthropicStream(config, messages, specs, sink)
+            else postAnthropic(config, messages, specs)
     }
 
     private class HttpError(val code: Int, val body: String) : RuntimeException("HTTP $code: $body")
 
-    private fun postOpenAi(
+    /** 一次工具调用在流里的累积状态:id / name 取首个非空,arguments 是碎片拼接。 */
+    private class ToolAcc {
+        var id: String? = null
+        var name: String? = null
+        val args = StringBuilder()
+    }
+
+    /** OpenAI /chat/completions 的 url + headers + body(不含 stream)。流式与非流式共用。 */
+    private fun openAiRequest(
         config: AiConfig,
         messages: JSONArray,
         specs: List<Tools.Spec>
-    ): JSONObject {
+    ): Triple<URL, Map<String, String>, JSONObject> {
         val body = JSONObject()
             .put("model", config.effectiveModel)
             .put("messages", messages)
@@ -343,10 +390,88 @@ object AiClient {
         val url = URL(if (base.endsWith("/chat/completions")) base else "$base/chat/completions")
         val headers = HashMap<String, String>()
         if (config.apiKey.isNotBlank()) headers["Authorization"] = "Bearer ${config.apiKey}"
+        return Triple(url, headers, body)
+    }
+
+    private fun postOpenAi(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>
+    ): JSONObject {
+        val (url, headers, body) = openAiRequest(config, messages, specs)
         return postJson(url, headers, body)
             .getJSONArray("choices")
             .getJSONObject(0)
             .getJSONObject("message")
+    }
+
+    /**
+     * OpenAI 流式。`stream=true` 后响应是一串 `data: {choices[0].delta}`,以 `[DONE]` 收尾。
+     * 一边收一边把正文 delta 推给 sink,tool_calls 的碎片按 index 拼起来,
+     * 最终重组成和 [postOpenAi] **完全一样**的 assistant message(content + 可能的 tool_calls)。
+     */
+    private fun postOpenAiStream(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>,
+        sink: StreamSink
+    ): JSONObject {
+        val (url, headers, body) = openAiRequest(config, messages, specs)
+        body.put("stream", true)
+
+        val content = StringBuilder()
+        val tools = LinkedHashMap<Int, ToolAcc>()   // index -> 累积
+        postJsonStream(url, headers, body) { payload ->
+            val obj = try { JSONObject(payload) } catch (t: Throwable) { return@postJsonStream }
+            val choices = obj.optJSONArray("choices") ?: return@postJsonStream
+            val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: return@postJsonStream
+
+            // 工具轮的 delta 里 content 是 JSON null,Android 的 optString 会把它变成字面量
+            // "null" 字符串 —— 不先挡掉会被当正文推上屏闪一下。用 isNull 判真空值。
+            val piece = if (delta.isNull("content")) "" else delta.optString("content", "")
+            if (piece.isNotEmpty()) {
+                content.append(piece)
+                sink.onDelta(content.toString())
+            }
+            val tcs = delta.optJSONArray("tool_calls") ?: return@postJsonStream
+            for (i in 0 until tcs.length()) {
+                val tc = tcs.optJSONObject(i) ?: continue
+                val idx = tc.optInt("index", i)
+                val acc = tools.getOrPut(idx) { ToolAcc() }
+                tc.optString("id").takeIf { it.isNotEmpty() }?.let { acc.id = it }
+                val fn = tc.optJSONObject("function")
+                if (fn != null) {
+                    // 同 content 的坑:很多端点第一帧的 arguments/name 是 JSON null,Android 的
+                    // optString 会把它变成字面量 "null" 拼进去 → "null{...}" 解析失败 → 参数丢空 →
+                    // 工具全挂、撞满工具循环上限。必须先 isNull 判真空值,别让 "null" 混进来。
+                    if (!fn.isNull("name")) {
+                        fn.optString("name").takeIf { it.isNotEmpty() }?.let { acc.name = it }
+                    }
+                    if (!fn.isNull("arguments")) acc.args.append(fn.optString("arguments", ""))
+                }
+            }
+        }
+
+        val msg = JSONObject().put("role", "assistant").put("content", content.toString())
+        if (tools.isNotEmpty()) {
+            val arr = JSONArray()
+            for ((_, acc) in tools) {
+                arr.put(
+                    JSONObject()
+                        .put("id", acc.id ?: "call_${arr.length()}")
+                        .put("type", "function")
+                        .put(
+                            "function",
+                            JSONObject()
+                                .put("name", acc.name ?: "")
+                                // extractCalls 认字符串化的 arguments;拼出来本就是字符串
+                                .put("arguments", acc.args.toString())
+                        )
+                )
+            }
+            msg.put("tool_calls", arr)
+        }
+        return msg
     }
 
     /**
@@ -363,6 +488,16 @@ object AiClient {
         messages: JSONArray,
         specs: List<Tools.Spec>
     ): JSONObject {
+        val (url, headers, body) = anthropicRequest(config, messages, specs)
+        return anthropicToOpenAi(postJson(url, headers, body))
+    }
+
+    /** Anthropic /messages 的 url + headers + body(不含 stream)。流式与非流式共用。 */
+    private fun anthropicRequest(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>
+    ): Triple<URL, Map<String, String>, JSONObject> {
         val system = StringBuilder()
         val converted = JSONArray()
         for (i in 0 until messages.length()) {
@@ -409,7 +544,81 @@ object AiClient {
         val headers = HashMap<String, String>()
         headers["anthropic-version"] = ANTHROPIC_VERSION
         if (config.apiKey.isNotBlank()) headers["x-api-key"] = config.apiKey
-        return anthropicToOpenAi(postJson(url, headers, body))
+        return Triple(url, headers, body)
+    }
+
+    /**
+     * Anthropic 流式。事件流里 `content_block_start/delta/stop`、`message_delta` 各带 `type`,
+     * 逐条读:`text_delta` 累积正文并推给 sink,`input_json_delta` 把 tool_use 的入参碎片拼起来。
+     * 最终重组成和 [postAnthropic] 一样、经 [anthropicToOpenAi] 之后的 OpenAI 形状 assistant message。
+     */
+    private fun postAnthropicStream(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>,
+        sink: StreamSink
+    ): JSONObject {
+        val (url, headers, body) = anthropicRequest(config, messages, specs)
+        body.put("stream", true)
+
+        val content = StringBuilder()
+        // content block index -> tool_use 累积(只登记 tool_use 块;text 块不进这里)
+        val tools = LinkedHashMap<Int, ToolAcc>()
+        postJsonStream(url, headers, body) { payload ->
+            val obj = try { JSONObject(payload) } catch (t: Throwable) { return@postJsonStream }
+            when (obj.optString("type")) {
+                "content_block_start" -> {
+                    val idx = obj.optInt("index", 0)
+                    val block = obj.optJSONObject("content_block")
+                    if (block != null && block.optString("type") == "tool_use") {
+                        tools[idx] = ToolAcc().apply {
+                            id = block.optString("id").ifEmpty { null }
+                            name = block.optString("name").ifEmpty { null }
+                        }
+                    }
+                }
+                "content_block_delta" -> {
+                    val d = obj.optJSONObject("delta") ?: return@postJsonStream
+                    when (d.optString("type")) {
+                        "text_delta" -> {
+                            val piece = d.optString("text", "")
+                            if (piece.isNotEmpty()) {
+                                content.append(piece)
+                                sink.onDelta(content.toString())
+                            }
+                        }
+                        "input_json_delta" -> {
+                            val idx = obj.optInt("index", 0)
+                            // 同上,防 partial_json 是 JSON null 时被拼成字面量 "null"。
+                            if (!d.isNull("partial_json")) {
+                                tools[idx]?.args?.append(d.optString("partial_json", ""))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 组回 OpenAI 形状。arguments 用累积出来的 JSON 字符串(空则给 {});extractCalls 认字符串。
+        val msg = JSONObject().put("role", "assistant").put("content", content.toString())
+        if (tools.isNotEmpty()) {
+            val arr = JSONArray()
+            for ((_, acc) in tools) {
+                arr.put(
+                    JSONObject()
+                        .put("id", acc.id ?: "call_${arr.length()}")
+                        .put("type", "function")
+                        .put(
+                            "function",
+                            JSONObject()
+                                .put("name", acc.name ?: "")
+                                .put("arguments", acc.args.toString().ifBlank { "{}" })
+                        )
+                )
+            }
+            msg.put("tool_calls", arr)
+        }
+        return msg
     }
 
     /** OpenAI 的 assistant message → Anthropic 的 assistant 消息(tool_calls 变 tool_use 块)。 */
@@ -503,6 +712,59 @@ object AiClient {
             return JSONObject(text)
         } finally {
             if (!bodyDrained) conn.disconnect()
+        }
+    }
+
+    /**
+     * 一次流式 POST。请求体须自带 `"stream": true`。
+     *
+     * 逐行读 SSE,把每条 `data:` 载荷(去掉前缀、跳过 `[DONE]` 与 `event:`/心跳行)交给 [onData]。
+     * 复用与 [postJson] 同理:**读到 EOF**(哪怕看到 `[DONE]` 也继续读干净)连接才算干净、可还池;
+     * 中途异常/没读完就 disconnect,免得半条流毒害下一次请求。
+     *
+     * 非 2xx 时和 [postJson] 一样:读完 errorStream 抛 [HttpError],让上层 400 降级逻辑照常触发 ——
+     * 状态码在流开始前就拿到,此刻一个 delta 都还没推,sink 状态干净。
+     */
+    private fun postJsonStream(
+        url: URL,
+        headers: Map<String, String>,
+        body: JSONObject,
+        onData: (String) -> Unit
+    ) {
+        val conn = url.openConnection() as HttpURLConnection
+        var drained = false
+        try {
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "text/event-stream")
+            for ((k, v) in headers) conn.setRequestProperty(k, v)
+            conn.doOutput = true
+            conn.connectTimeout = 30000
+            // 流式下 readTimeout 是「两次数据之间」的间隔,不是总时长 —— 60s 没有 token 才算超时,足够。
+            conn.readTimeout = 60000
+
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val text = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                drained = true
+                throw HttpError(code, text)
+            }
+            conn.inputStream.bufferedReader().use { reader ->
+                var done = false
+                while (true) {
+                    val line = reader.readLine() ?: break   // EOF
+                    if (done) continue                        // [DONE] 之后只管把流读干净
+                    if (line.isEmpty() || !line.startsWith("data:")) continue
+                    val payload = line.substring(5).trim()
+                    if (payload == "[DONE]") { done = true; continue }
+                    if (payload.isNotEmpty()) onData(payload)
+                }
+            }
+            drained = true
+        } finally {
+            if (!drained) conn.disconnect()
         }
     }
 
