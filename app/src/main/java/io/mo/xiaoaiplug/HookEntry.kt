@@ -2125,9 +2125,19 @@ class HookEntry : IXposedHookLoadPackage {
     // AI 回复 + bridge 实例都齐了才注入,只注入一次
     private fun maybeInject(dialogId: String) {
         if (dialogId in injected) return
-        val answer = aiAnswers[dialogId] ?: return
-        val bridge = bridgeRefs[dialogId]?.get() ?: return
-        val method = sendStreamDataMethod ?: return
+        val answer = aiAnswers[dialogId] ?: return   // 答案还没到,正常路过,不值得记
+        // 下面两个缺一样都等于"这轮永远不会上屏"。原先是静默 return,
+        // 于是"卡片一直空白"在日志里和"根本没走到这"长得一模一样,只能靠猜。
+        val bridge = bridgeRefs[dialogId]?.get()
+        if (bridge == null) {
+            Log.i(TAG, "no bridge for dialogId=$dialogId, cannot inject")
+            return
+        }
+        val method = sendStreamDataMethod
+        if (method == null) {
+            Log.i(TAG, "sendStreamData method unavailable, cannot inject dialogId=$dialogId")
+            return
+        }
 
         // RN 的 JS 侧还没 ready 的话,现在发过去等于石沉大海。
         // 先不标记 injected,等 rnStartReceiveInstruction 回调时会再调一次这里。
@@ -2149,13 +2159,34 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             } catch (t: Throwable) { }
 
-            // 【2026-07-25 去重】原先这里既发 ToastStream(markdown_text=answer) 又调 p1(totalText=answer),
-            // 两条通道各渲一块 → 同一段答案上屏两遍。trace 实锤(r70.a.sendStreamData):小爱自己的
-            // ToastStream 答案已经被 filterOutToastStream 滤掉了,所以两段就是我们自己这两条。
-            // 现在**只留 p1**:它既显示我们的答案、又覆盖小爱写在 totalText 里的兜底话,一块搞定。
-            // 仍发 <FINAL>+Finish 关掉小爱的流(否则卡片停在 loading),但不再发我们自己的正文块。
+            // 【2026-07-25 去重】曾经把这条 ToastStream 删掉,只留 p1,理由是"两条通道各渲一块"。
+            // 【当天晚些时候修正】那个判断错了,p1 根本不画东西 —— 反编译实锤
+            // (TemplateReactNativeCard.p1,调用方 configCardPressMenu):它只往数据模型
+            // stream.c.d 里写 totalText/isLlmContentDisplayComplete,没有任何 view/JS 通知,
+            // 消费方是长按菜单的复制内容和喇叭重播的文本。RN 卡片屏幕上的字**只有**
+            // sendStreamData(instruction, ToastStream) 这一条来源。
+            // 删掉之后现象:"手机现在开放端口有几个"答案 9.4 秒就回来了、TTS 也念了,
+            // 卡片却全程空白(带"AI生成"角标的空卡),日志里 p1 还报告 rendered 成功。
+            // 当时看到的两段其实是"我们的 ToastStream + 小爱漏网的 ToastStream" ——
+            // 小爱给搜索类答案用的 dialogId 和 ASR 那个对不上,老的 takeOver 判据漏了它。
+            // 那一漏已由同 commit 新增的静音泵兜底过滤(见 hookBridge)堵死,所以这里恢复
+            // 正文块不会让双段回来。
             try {
                 injectingNow.set(true)
+                val transactionId = UUID.randomUUID().toString().replace("-", "")
+                val contentPayload = JSONObject().apply {
+                    put("header", JSONObject().apply {
+                        put("name", "ToastStream")
+                        put("namespace", "Template")
+                        put("dialog_id", dialogId)
+                        put("id", UUID.randomUUID().toString().replace("-", ""))
+                        put("transaction_id", transactionId)
+                    })
+                    put("payload", JSONObject().apply { put("markdown_text", answer) })
+                }
+                method.invoke(bridge, "instruction", contentPayload.toString())
+                Log.i(TAG, "injected answer via ToastStream dialogId=$dialogId len=${answer.length}")
+
                 val finalPayload = JSONObject().apply {
                     put("header", JSONObject().apply {
                         put("id", UUID.randomUUID().toString())
@@ -2173,8 +2204,10 @@ class HookEntry : IXposedHookLoadPackage {
                 injectingNow.set(false)
             }
 
-            // 唯一的显示通道:p1 设 totalText。p1 是 raw 渲染,所以先把 markdown 的加粗/代码标记去掉,
-            // 免得屏幕上露出 **…** / `…`(语音助手的答案纯文本足够,不需要富文本)。
+            // p1 设 totalText:**不是显示通道**(理由见上面的注释),但它是「权威文本」——
+            // 长按复制、卡片上喇叭按钮重播读的都是它。不设的话那两处还留着小爱的兜底话。
+            // 这里给纯文本版:复制/朗读不需要 **…** / `…` 这些 markdown 标记,
+            // 而屏幕显示走的 ToastStream 是 markdown_text,原样发,富文本由前端渲。
             try {
                 val card = cardRefs[dialogId]?.get()
                 if (card != null) {
@@ -2187,7 +2220,10 @@ class HookEntry : IXposedHookLoadPackage {
                         put("isIllegalContent", false)
                     }
                     p1.invoke(card, obj)
-                    Log.i(TAG, "rendered answer via p1(totalText) dialogId=$dialogId")
+                    Log.i(TAG, "synced authoritative text via p1(totalText) dialogId=$dialogId")
+                } else {
+                    // 没拿到卡不影响显示(那条走 bridge),只是复制/重播读到的还是小爱的话。
+                    Log.i(TAG, "no RN card for p1(totalText) dialogId=$dialogId")
                 }
             } catch (t: Throwable) {
                 Log.i(TAG, "p1() render failed dialogId=$dialogId: $t")
