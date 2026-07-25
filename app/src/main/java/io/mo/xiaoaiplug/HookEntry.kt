@@ -1651,6 +1651,22 @@ class HookEntry : IXposedHookLoadPackage {
                         startMutePump(dialogId)
                         maybeForceShow(dialogId)
                     }
+                    // 小爱自己的 ToastStream 答案漏网补刀:只要静音泵在跑(说明这轮交互确实由我们接管),
+                    // 就无差别把 ToastStream 滤掉 —— 哪怕这条指令挂的 dialogId 还没进 takeOver。
+                    // 真机实测:小爱给"搜索类"答案用的 dialogId 常和 ASR 那个对不上,光靠 dialogId in
+                    // takeOver 判会漏,它那段("若想了解…/很抱歉…")就照样上屏,和我们的答案并列成两段。
+                    // 这里只删小爱的文字内容(filterOutToastStream 只摘 ToastStream 条目),不碰接管流程。
+                    if (type == "instruction" && dialogId !in takeOver && isMutePumpActive()) {
+                        val filtered = filterOutToastStream(content)
+                        if (filtered == null) {
+                            Log.i(TAG, "suppress xiaoai ToastStream (pump active, dialogId=$dialogId not-yet-takeover)")
+                            param.result = null
+                            return
+                        } else if (filtered != content) {
+                            Log.i(TAG, "stripped xiaoai ToastStream (pump active) dialogId=$dialogId")
+                            param.args[1] = filtered
+                        }
+                    }
                     if (dialogId in takeOver && type == "instruction") {
                         bridgeRefs[dialogId] = WeakReference(param.thisObject)
                         val filtered = filterOutToastStream(content)
@@ -2133,22 +2149,13 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             } catch (t: Throwable) { }
 
+            // 【2026-07-25 去重】原先这里既发 ToastStream(markdown_text=answer) 又调 p1(totalText=answer),
+            // 两条通道各渲一块 → 同一段答案上屏两遍。trace 实锤(r70.a.sendStreamData):小爱自己的
+            // ToastStream 答案已经被 filterOutToastStream 滤掉了,所以两段就是我们自己这两条。
+            // 现在**只留 p1**:它既显示我们的答案、又覆盖小爱写在 totalText 里的兜底话,一块搞定。
+            // 仍发 <FINAL>+Finish 关掉小爱的流(否则卡片停在 loading),但不再发我们自己的正文块。
             try {
                 injectingNow.set(true)
-                val transactionId = UUID.randomUUID().toString().replace("-", "")
-                val instrId = UUID.randomUUID().toString().replace("-", "")
-                val contentPayload = JSONObject().apply {
-                    put("header", JSONObject().apply {
-                        put("name", "ToastStream")
-                        put("namespace", "Template")
-                        put("dialog_id", dialogId)
-                        put("id", instrId)
-                        put("transaction_id", transactionId)
-                    })
-                    put("payload", JSONObject().apply { put("markdown_text", answer) })
-                }
-                method.invoke(bridge, "instruction", contentPayload.toString())
-
                 val finalPayload = JSONObject().apply {
                     put("header", JSONObject().apply {
                         put("id", UUID.randomUUID().toString())
@@ -2158,31 +2165,32 @@ class HookEntry : IXposedHookLoadPackage {
                 }
                 method.invoke(bridge, "instruction", finalPayload.toString())
                 method.invoke(bridge, "Finish", "")
-                Log.i(TAG, "injected AI answer via bridge, dialogId=$dialogId")
+                Log.i(TAG, "closed xiaoai stream (<FINAL>+Finish) dialogId=$dialogId")
             } catch (t: Throwable) {
-                Log.i(TAG, "inject failed dialogId=$dialogId: $t")
+                Log.i(TAG, "stream close failed dialogId=$dialogId: $t")
                 injected.remove(dialogId)
             } finally {
                 injectingNow.set(false)
             }
 
-            // 备用渲染通道:直接调用 TemplateReactNativeCard.p1(JSONObject),
-            // 直接设置卡片内部的 totalText,应对"简单问答"这类不走 ToastStream 流式通道的场景
+            // 唯一的显示通道:p1 设 totalText。p1 是 raw 渲染,所以先把 markdown 的加粗/代码标记去掉,
+            // 免得屏幕上露出 **…** / `…`(语音助手的答案纯文本足够,不需要富文本)。
             try {
                 val card = cardRefs[dialogId]?.get()
                 if (card != null) {
                     val p1 = card.javaClass.getDeclaredMethod("p1", JSONObject::class.java)
                     p1.isAccessible = true
+                    val plain = answer.replace("**", "").replace("`", "")
                     val obj = JSONObject().apply {
-                        put("totalText", answer)
+                        put("totalText", plain)
                         put("isLlmContentDisplayComplete", true)
                         put("isIllegalContent", false)
                     }
                     p1.invoke(card, obj)
-                    Log.i(TAG, "fallback p1() render dialogId=$dialogId")
+                    Log.i(TAG, "rendered answer via p1(totalText) dialogId=$dialogId")
                 }
             } catch (t: Throwable) {
-                Log.i(TAG, "fallback p1() render failed dialogId=$dialogId: $t")
+                Log.i(TAG, "p1() render failed dialogId=$dialogId: $t")
             }
         }
     }
