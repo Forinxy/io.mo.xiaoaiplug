@@ -18,6 +18,7 @@ class UiPrefs private constructor(context: Context) {
         private const val PREFS_NAME = "xiaoai_plug_ui"
         private const val KEY_DARK_MODE = "dark_mode"
         private const val KEY_ACCENT = "accent"
+        private const val KEY_AUTO_CHECK_UPDATE = "auto_check_update"
 
         @Volatile
         private var instance: UiPrefs? = null
@@ -44,6 +45,10 @@ class UiPrefs private constructor(context: Context) {
     )
     val accent: StateFlow<AccentColor> = _accent.asStateFlow()
 
+    /** 启动时是否自动查一遍新版本。默认开 —— 关掉之后设置里的「检查更新」仍然能手动点。 */
+    private val _autoCheckUpdate = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CHECK_UPDATE, true))
+    val autoCheckUpdate: StateFlow<Boolean> = _autoCheckUpdate.asStateFlow()
+
     fun setDarkMode(mode: DarkMode) {
         _darkMode.value = mode
         prefs.edit().putString(KEY_DARK_MODE, mode.name).apply()
@@ -52,5 +57,10 @@ class UiPrefs private constructor(context: Context) {
     fun setAccent(accent: AccentColor) {
         _accent.value = accent
         prefs.edit().putString(KEY_ACCENT, accent.name).apply()
+    }
+
+    fun setAutoCheckUpdate(enabled: Boolean) {
+        _autoCheckUpdate.value = enabled
+        prefs.edit().putBoolean(KEY_AUTO_CHECK_UPDATE, enabled).apply()
     }
 }

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -20,8 +21,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.mo.xiaoaiplug.ui.ConfigViewModel
+import io.mo.xiaoaiplug.ui.UpdateViewModel
 import io.mo.xiaoaiplug.ui.config.ConfigTab
 import io.mo.xiaoaiplug.ui.home.HomeScreen
+import io.mo.xiaoaiplug.ui.home.UpdateDialog
 import io.mo.xiaoaiplug.ui.logs.LogsScreen
 import io.mo.xiaoaiplug.ui.settings.SettingsScreen
 import top.yukonga.miuix.kmp.basic.Scaffold
@@ -51,6 +54,11 @@ fun AppRoot() {
     // 所以设置页那边 showToast 一下，这里就能显示出来。
     val vm: ConfigViewModel = viewModel()
     val toast by vm.toast.collectAsStateWithLifecycle()
+
+    val updateVm: UpdateViewModel = viewModel()
+    val pendingUpdate by updateVm.pending.collectAsStateWithLifecycle()
+    // 一次进程只查一次；UpdateViewModel 自己会挡住重复触发和「开关关掉」的情况
+    LaunchedEffect(Unit) { updateVm.checkOnLaunch() }
 
     val surfaceColor = MiuixTheme.colorScheme.surface
     // 关键：录制图层前先铺一层不透明底色。少了这句，采样到的是透明像素，
@@ -101,6 +109,17 @@ fun AppRoot() {
             }
             // 放在 layerBackdrop 那层**外面**：进去的话底栏会把提示条一起采样进模糊里。
             BottomToast(message = toast, bottomInset = bottomInset)
+
+            // 更新弹窗同样在 layerBackdrop 外面，但它采样 backdrop（应用内容层）做毛玻璃 ——
+            // 于是卡片透出的是它背后那一整屏应用界面的模糊。
+            UpdateDialog(
+                visible = pendingUpdate != null,
+                release = pendingUpdate,
+                currentVersion = updateVm.currentVersion,
+                backdrop = backdrop,
+                onDismiss = { updateVm.dismiss() },
+                onUpdate = { updateVm.openDownload() }
+            )
         }
     }
 }

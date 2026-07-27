@@ -21,6 +21,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.mo.xiaoaiplug.ui.ConfigViewModel
+import io.mo.xiaoaiplug.ui.ManualCheck
+import io.mo.xiaoaiplug.ui.UpdateViewModel
 import io.mo.xiaoaiplug.ui.nav.CardContentPadding
 import io.mo.xiaoaiplug.ui.nav.PageScaffold
 import io.mo.xiaoaiplug.ui.theme.AccentColor
@@ -35,18 +37,26 @@ import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.basic.TabRowDefaults
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 private const val SOURCE_URL = "https://github.com/lm060719/XiaoAi-plug"
 
 @Composable
-fun SettingsScreen(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
+fun SettingsScreen(
+    bottomInset: Dp,
+    vm: ConfigViewModel = viewModel(),
+    updateVm: UpdateViewModel = viewModel()
+) {
     val context = LocalContext.current
     val prefs = remember(context) { UiPrefs.get(context) }
     val darkMode by prefs.darkMode.collectAsStateWithLifecycle()
     val accent by prefs.accent.collectAsStateWithLifecycle()
     val config by vm.config.collectAsStateWithLifecycle()
+
+    val autoCheckUpdate by updateVm.autoCheckUpdate.collectAsStateWithLifecycle()
+    val manualCheck by updateVm.manual.collectAsStateWithLifecycle()
 
     val modes = remember { DarkMode.entries.toList() }
 
@@ -107,6 +117,32 @@ fun SettingsScreen(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
                         )
                     }
                 }
+            }
+        }
+
+        item { SmallTitle("更新") }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                SwitchPreference(
+                    checked = autoCheckUpdate,
+                    onCheckedChange = { on -> updateVm.setAutoCheckUpdate(on) },
+                    title = "检查更新",
+                    summary = "打开应用自动检查新版本"
+                )
+                ArrowPreference(
+                    title = "检查更新",
+                    summary = when (val s = manualCheck) {
+                        ManualCheck.Running -> "正在检查…"
+                        ManualCheck.UpToDate -> "已是最新版本"
+                        is ManualCheck.Failed -> s.reason
+                        // 有新版时弹窗会自己冒出来，这里回到静默态，只报当前版本
+                        ManualCheck.Idle ->
+                            if (updateVm.currentVersion.isNotEmpty())
+                                "当前 V${updateVm.currentVersion}"
+                            else "点击检查新版本"
+                    },
+                    onClick = { updateVm.checkManually() }
+                )
             }
         }
 

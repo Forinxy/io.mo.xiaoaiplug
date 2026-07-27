@@ -136,14 +136,6 @@ fun ToolsScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                     )
                 }
             }
-            item {
-                Text(
-                    text = "无论哪档，格式化 / 删除系统或数据分区 / 刷机 / 重启 等毁灭性命令都会被硬拦。",
-                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 8.dp)
-                )
-            }
         }
 
         if (readOnly.isNotEmpty()) {
