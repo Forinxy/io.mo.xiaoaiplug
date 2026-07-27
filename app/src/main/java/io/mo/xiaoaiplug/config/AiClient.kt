@@ -215,7 +215,7 @@ object AiClient {
             messages.put(reply)
 
             val toolAt = System.currentTimeMillis()
-            val results = runCallsParallel(calls, ctx, iter, allowMutating)
+            val results = runCallsParallel(calls, ctx, iter, allowMutating, config.effectiveShellPolicy)
             steps.add(
                 (if (calls.size == 1) "工具" else "工具×${calls.size}")
                         to System.currentTimeMillis() - toolAt
@@ -251,19 +251,20 @@ object AiClient {
 
     /** 并行执行本轮所有工具,返回与 calls 同序的结果。 */
     private fun runCallsParallel(
-        calls: List<Call>, ctx: Context?, iter: Int, allowMutating: () -> Boolean
+        calls: List<Call>, ctx: Context?, iter: Int, allowMutating: () -> Boolean,
+        shellPolicy: Tools.ShellPolicy
     ): List<String> {
         if (calls.size == 1) {
             val c = calls[0]
             val t0 = System.currentTimeMillis()
-            val r = Tools.execute(c.name, c.args, ctx, allowMutating())
+            val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy)
             logCall(iter, c, t0, r, ctx)
             return listOf(r)
         }
         val futures = calls.map { c ->
             val t0 = System.currentTimeMillis()
             toolPool.submit<String> {
-                val r = Tools.execute(c.name, c.args, ctx, allowMutating())
+                val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy)
                 logCall(iter, c, t0, r, ctx)
                 r
             }

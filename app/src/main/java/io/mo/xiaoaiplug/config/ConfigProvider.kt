@@ -32,6 +32,8 @@ object ConfigKeys {
 
     // 允许模型调用的工具名,逗号分隔。空串 = 全开。
     const val ENABLED_TOOLS = "enabled_tools"
+    // run_shell 安全策略:""/full / readonly / disabled(见 Tools.ShellPolicy)。空串 = full。
+    const val SHELL_POLICY = "shell_policy"
     // 用 OpenAI 原生 function calling(带 tools 参数)。端点不支持时会自动降级到文本约定。
     const val USE_NATIVE_TOOLS = "use_native_tools"
 
@@ -50,7 +52,7 @@ object ConfigKeys {
         BLOCK_VIEW_JUMP, JUMP_ALLOW_WORDS,
         BLOCK_WEB_SEARCH, WEB_SEARCH_ALLOW_WORDS,
         SPEAK_ANSWER,
-        ENABLED_TOOLS, USE_NATIVE_TOOLS, CONTEXT_ENABLED,
+        ENABLED_TOOLS, SHELL_POLICY, USE_NATIVE_TOOLS, CONTEXT_ENABLED,
         SKIP_TAKEOVER_ENABLED, SKIP_TAKEOVER_PATTERN,
         AUTO_FIX_ACCESSIBILITY
     )

@@ -24,6 +24,9 @@ data class AiConfig(
     val speakAnswer: Boolean,
     // 允许模型调用的工具,逗号分隔;空串 = 全开
     val enabledTools: String = "",
+    // run_shell 安全策略:full(默认/旧存档) / readonly(只放行只读命令) / disabled(整体禁用)。
+    // 见 Tools.ShellPolicy。毁灭性命令(格式化/删分区/刷机…)在任何档下都硬拦。
+    val shellPolicy: String = "",
     // 原生 function calling(默认开,端点不支持会自动降级)
     val useNativeTools: Boolean = true,
     // 多轮上下文:带上最近一小时内的问答(默认开)。见 ChatHistory。
@@ -51,6 +54,9 @@ data class AiConfig(
      */
     val effectiveEndpoint: String get() = endpoint.ifBlank { aiProvider.defaultEndpoint }
     val effectiveModel: String get() = model.ifBlank { aiProvider.defaultModel }
+
+    /** run_shell 实际生效的安全策略。空串/旧存档 → FULL(保持原行为)。 */
+    val effectiveShellPolicy: Tools.ShellPolicy get() = Tools.ShellPolicy.fromKey(shellPolicy)
 
     /**
      * 实际发给模型的系统提示词:用户留空就用内置的 [DEFAULT_SYSTEM_PROMPT]。
@@ -126,6 +132,8 @@ object ConfigClient {
             webSearchAllowWords = if (searchAllowRaw.isNullOrEmpty()) DEFAULT_WEB_SEARCH_ALLOW_WORDS else searchAllowRaw,
             speakAnswer = speakRaw.isNullOrEmpty() || speakRaw == "true",
             enabledTools = result?.getString(ConfigKeys.ENABLED_TOOLS).orEmpty(),
+            // 空串 = 旧存档/没设过 → effectiveShellPolicy 落到 FULL,行为不变。
+            shellPolicy = result?.getString(ConfigKeys.SHELL_POLICY).orEmpty(),
             useNativeTools = nativeToolsRaw.isNullOrEmpty() || nativeToolsRaw == "true",
             contextEnabled = contextRaw.isNullOrEmpty() || contextRaw == "true",
             skipTakeoverEnabled = skipTakeoverRaw.isNullOrEmpty() || skipTakeoverRaw == "true",
@@ -152,6 +160,7 @@ object ConfigClient {
             putString(ConfigKeys.WEB_SEARCH_ALLOW_WORDS, config.webSearchAllowWords)
             putString(ConfigKeys.SPEAK_ANSWER, config.speakAnswer.toString())
             putString(ConfigKeys.ENABLED_TOOLS, config.enabledTools)
+            putString(ConfigKeys.SHELL_POLICY, config.shellPolicy)
             putString(ConfigKeys.USE_NATIVE_TOOLS, config.useNativeTools.toString())
             putString(ConfigKeys.CONTEXT_ENABLED, config.contextEnabled.toString())
             putString(ConfigKeys.SKIP_TAKEOVER_ENABLED, config.skipTakeoverEnabled.toString())

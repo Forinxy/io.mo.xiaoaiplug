@@ -93,4 +93,69 @@ class ShellGateTest {
         "   ",
         "grep 'unterminated"                       // 引号没闭合,拆不可信
     )
+
+    // ---------------------------------------------------------------- 毁灭性黑名单
+
+    /**
+     * [Tools.isDestructiveShell] 的真值表。这道闸和 [Tools.isReadOnlyShell] 不同:
+     * 它对**所有策略档**生效(包括全开、包括已接管本轮),命中即拒。目的是防模型抽风或被
+     * 工具返回内容里的注入指令诱导,一条命令抹掉系统/数据。宁可误拦边缘命令,也不能漏一条。
+     */
+    private fun assertDestructive(vararg cmds: String) {
+        for (c in cmds) assertEquals("应判为毁灭性: $c", true, Tools.isDestructiveShell(c))
+    }
+
+    private fun assertSafe(vararg cmds: String) {
+        for (c in cmds) assertEquals("不该判为毁灭性: $c", false, Tools.isDestructiveShell(c))
+    }
+
+    @Test
+    fun `格式化刷机写块设备一律毁灭`() = assertDestructive(
+        "mkfs.ext4 /dev/block/sda",
+        "mke2fs /dev/block/by-name/userdata",       // mkfs\w* 覆盖 mkfs.xxx / mke2fs 走下条? 见下
+        "fastboot erase userdata",
+        "dd if=/dev/zero of=/dev/block/bootdevice/by-name/boot",
+        "cat rom.img > /dev/block/mmcblk0",
+        "blockdev --setrw /dev/block/sda"
+    )
+
+    @Test
+    fun `重启关机拦下`() = assertDestructive(
+        "reboot",
+        "reboot recovery",
+        "getprop x && reboot",
+        "svc power shutdown",
+        "svc power reboot"
+    )
+
+    @Test
+    fun `递归删除根级路径拦下`() = assertDestructive(
+        "rm -rf /",
+        "rm -rf /data",
+        "rm -fr /system/",
+        "rm -r /sdcard",
+        "rm -rf /data/*",
+        "rm --recursive /vendor",
+        "getprop x; rm -rf /data",                  // 串在只读后面也要抓到
+        "rm -Rf /storage"                           // 大写 R
+    )
+
+    @Test
+    fun `fork bomb 拦下`() = assertDestructive(
+        ":(){ :|:& };:",
+        ":(){:|:&};:"
+    )
+
+    @Test
+    fun `正常命令不误判为毁灭`() = assertSafe(
+        "rm /sdcard/tmp.txt",                       // 非递归,删单个文件
+        "rm -rf /sdcard/Download/cache",            // 递归但目标是子目录,不是根
+        "rm -rf /data/local/tmp/x",                 // 同上
+        "getprop ro.build.version.release",
+        "dd if=/sdcard/a of=/sdcard/b",             // dd 不写 /dev
+        "cat /proc/meminfo",
+        "settings put system screen_brightness 100",
+        "am force-stop com.foo",                    // 强杀应用不算毁灭
+        "pm uninstall com.foo"                      // 卸载单个应用交给 readonly/full 判,不硬拦
+    )
 }

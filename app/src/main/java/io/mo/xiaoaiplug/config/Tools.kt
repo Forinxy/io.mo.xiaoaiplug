@@ -83,10 +83,10 @@ object Tools {
     val ALL: List<Spec> by lazy {
         listOf(
             runShell, deviceStatus, wifiInfo, networkInfo, topMemoryApps, topStorageApps,
-            listApps, launchApp, sendMessage, readFile,
+            listApps, launchApp, sendMessage, queryContacts, readFile,
             getSetting, setSetting,
-            mediaControl, setVolume,
-            currentTime, recentNotifications, getLocation, weather,
+            mediaControl, setVolume, bluetoothControl,
+            currentTime, recentNotifications, clipboard, getLocation, weather,
             readSmsCode, getScreenContent, getLogcat, appStateControl,
             saveMemory
         )
@@ -102,6 +102,31 @@ object Tools {
 
     /** 用户把工具全关掉时存这个,以区别于"老存档里压根没有这个字段"(空串 = 全开)。 */
     const val NONE = "none"
+
+    /** run_shell 的工具名。安全策略闸要按名字单独认出它(它是唯一接受任意命令串的工具)。 */
+    const val RUN_SHELL = "run_shell"
+
+    /**
+     * run_shell 执行策略。它是唯一接受**任意命令串**、又以 root 执行的工具,风险面最大 ——
+     * 模型自己误判、或被 read_file / 短信 / 屏幕文本里夹带的注入指令诱导,都可能跑出破坏性命令。
+     * 这道闸让用户能收窄它。空串 / 旧存档 = [FULL],保持原行为。
+     */
+    enum class ShellPolicy {
+        /** run_shell 整体不可用(工具页也能整体关,这档是配置里的便捷冗余)。 */
+        DISABLED,
+        /** 只放行只读命令([isReadOnlyShell]),会改设备状态的一律拒 —— 保留查询、禁掉动手。 */
+        READONLY,
+        /** 当前行为:写命令仍受"仅接管轮执行"的 allowMutating 闸约束,但不再额外限制。 */
+        FULL;
+
+        companion object {
+            fun fromKey(s: String): ShellPolicy = when (s.trim().lowercase()) {
+                "disabled", "off" -> DISABLED
+                "readonly", "read_only" -> READONLY
+                else -> FULL
+            }
+        }
+    }
 
     /** 配置里勾选的工具;`csv` 为空表示全开(老存档没这个字段),`none` 表示全关。 */
     fun enabled(csv: String): List<Spec> {
@@ -217,9 +242,21 @@ object Tools {
      * `allowMutating` 在**执行时**求值,不是调用开始时:接管信号(takeOver / 静音泵)
      * 往往比模型调用晚到,开始时判定会误杀。
      */
-    fun execute(name: String, args: JSONObject, ctx: Context?, allowMutating: Boolean = true): String {
+    fun execute(
+        name: String,
+        args: JSONObject,
+        ctx: Context?,
+        allowMutating: Boolean = true,
+        shellPolicy: ShellPolicy = ShellPolicy.FULL
+    ): String {
         val spec = byName[name]
             ?: return "error: unknown tool \"$name\"; available: ${byName.keys.joinToString(",")}"
+        // run_shell 单独过一道策略闸(它是唯一接受任意命令串的工具)。这道闸在 allowMutating
+        // 之前:毁灭性命令即使在接管轮、即使策略全开,也一律硬拦。
+        if (name == RUN_SHELL) {
+            shellDenial(args.optString("command", args.optString("cmd", "")).trim(), shellPolicy)
+                ?.let { Log.w(TAG, "shell policy blocked run_shell ($shellPolicy)"); return it }
+        }
         val mutating = spec.mutatingWhen?.invoke(args) ?: spec.mutating
         if (mutating && !allowMutating) {
             Log.i(TAG, "blocked mutating tool $name (round not ours)")
@@ -234,10 +271,79 @@ object Tools {
         }
     }
 
+    /**
+     * run_shell 策略闸。返回拒绝理由(直接回给模型,让它换只读工具或如实告知用户)或 null(放行)。
+     *
+     * 毁灭性黑名单对**所有档**生效,包括 FULL —— 那类命令没有任何正常用途值得为它冒险。
+     */
+    private fun shellDenial(cmd: String, policy: ShellPolicy): String? {
+        if (cmd.isEmpty()) return null   // 空命令留给 handler 自己回 "empty command"
+        if (isDestructiveShell(cmd))
+            return "error: 该命令被安全策略硬拦：疑似毁灭性操作（格式化 / 删除系统或数据分区 / 写裸块设备 / 刷机 / 重启 / fork bomb）。" +
+                    "任何策略档下都不执行。如确有必要，请让用户手动在终端里做。"
+        return when (policy) {
+            ShellPolicy.DISABLED ->
+                "error: run_shell 已被「shell 安全策略」禁用。请改用专用工具；" +
+                        "确需执行命令时，让用户在「工具」页把策略改为「仅只读」或「全开」。"
+            ShellPolicy.READONLY ->
+                if (isReadOnlyShell(cmd)) null
+                else "error: 当前「shell 安全策略」为「仅只读」，会改变设备状态的命令已禁用。" +
+                        "只能执行查询类命令（getprop / cat / ls / dumpsys / settings get / pm list 等）。"
+            ShellPolicy.FULL -> null
+        }
+    }
+
+    /**
+     * 毁灭性命令判定。**internal 是为了给 ShellGateTest 直接测** —— 和 [isReadOnlyShell] 一样,
+     * 这是安全闸,光靠推演会漏(rm 的 flag 顺序、路径写法变体太多),必须真跑测试钉住。
+     *
+     * 认的是"任何档都不放"那一类:格式化、刷机、写裸块设备、fork bomb、重启关机、
+     * 以及递归删除系统 / 数据 / 存储根。目的是防模型抽风或被注入诱导,**不是**防持 root 的用户
+     * (那没意义),所以不追求防绕过,宁可偶尔误拦一条边缘命令,也不放过一次 rm -rf /data。
+     */
+    internal fun isDestructiveShell(cmd: String): Boolean {
+        val c = cmd.lowercase()
+        if (c.replace(Regex("\\s+"), "").contains(":(){:|:&};:")) return true      // fork bomb
+        if (Regex("\\b(mkfs\\w*|mke2fs|make_ext4fs)\\b").containsMatchIn(c)) return true  // 格式化
+        if (Regex("\\b(fastboot|blockdev)\\b").containsMatchIn(c)) return true       // 刷机 / 块设备操作
+        if (Regex("\\breboot\\b").containsMatchIn(c)) return true                    // 重启
+        if (Regex("\\bsvc\\s+power\\s+(shutdown|reboot)\\b").containsMatchIn(c)) return true
+        if (Regex("\\bdd\\b[^|;&\\n]*\\bof=\\s*/dev/").containsMatchIn(c)) return true // dd 写块设备
+        if (Regex(">\\s*/dev/block/").containsMatchIn(c)) return true                 // 覆写块设备
+        return isRecursiveRmOnRoot(c)
+    }
+
+    /** 是否存在"递归删除 + 目标是根级危险路径"的 rm 命令段。 */
+    private fun isRecursiveRmOnRoot(lower: String): Boolean {
+        for (seg in lower.split(Regex("[|;&\\n]"))) {
+            val s = seg.trim()
+            if (s != "rm" && !s.startsWith("rm ")) continue
+            val tokens = s.split(Regex("\\s+"))
+            val recursive = tokens.contains("--recursive") ||
+                    tokens.any { it.length >= 2 && it[0] == '-' && it.getOrNull(1) != '-' && it.contains('r') }
+            if (!recursive) continue
+            val targets = tokens.drop(1).filter { !it.startsWith("-") }
+            if (targets.any { isDangerousPath(it) }) return true
+        }
+        return false
+    }
+
+    /** 根级危险路径:删了这些等于抹系统 / 数据。 */
+    private fun isDangerousPath(p: String): Boolean {
+        val t = p.trim().trim('\'', '"').trimEnd('/')
+        if (t.isEmpty()) return true    // rm -rf /  (trimEnd 后成空)
+        return t in DANGEROUS_ROOTS || Regex("^/[a-z_]+/?\\*$").matches(t)
+    }
+
+    private val DANGEROUS_ROOTS = setOf(
+        "/system", "/vendor", "/data", "/storage", "/sdcard", "/dev", "/proc",
+        "/sys", "/mnt", "/product", "/odm", "/*", "/data/data", "/data/*", "*", "/."
+    )
+
     // ---------------------------------------------------------------- 通用 shell
 
     private val runShell = Spec(
-        name = "run_shell",
+        name = RUN_SHELL,
         description = "以 root 执行任意 shell 命令。",
         modelHint = "用于没有专用工具覆盖的操作（安装/卸载应用、查看进程详情、改文件权限等）。" +
                 "能用专用工具就用专用工具——那些已经把输出解析好了，run_shell 的原始输出往往很长且要多轮往返。" +
@@ -999,6 +1105,60 @@ object Tools {
 
     private const val UI_AUTO_WECHAT = "com.tencent.mm"
 
+    // ---------------------------------------------------------------- 通讯录
+
+    /**
+     * 查通讯录号码。和 [readSmsCode] 一样走 `content query` 而不是直接读 contacts2.db ——
+     * 那个库是 WAL、还常被锁,content provider 自己处理并发,root 下直接查最稳。
+     * 只读,不改任何东西。
+     */
+    private val queryContacts = Spec(
+        name = "query_contacts",
+        description = "查询通讯录联系人的电话号码",
+        modelHint = "用户问「张三的电话是多少」「给我李四的号码」「通讯录里有没有姓王的」时用。" +
+                "按姓名模糊匹配，返回姓名+号码；一个人有多个号码会一并列出。留空 name 返回前若干条。",
+        params = listOf(
+            Param("name", "string", "按联系人姓名过滤(模糊匹配)，留空返回前若干条"),
+            Param("limit", "integer", "最多返回几个联系人，默认 20")
+        ),
+        handler = { args, _ ->
+            queryContactsImpl(
+                args.optString("name", "").trim(),
+                args.optInt("limit", 20).coerceIn(1, 100)
+            )
+        }
+    )
+
+    private fun queryContactsImpl(name: String, limit: Int): String {
+        val raw = sh(
+            "content query --uri content://com.android.contacts/data/phones " +
+                "--projection display_name:data1",
+            limit = 256 * 1024
+        )
+        if (raw.contains("Permission Denial", true) || raw.startsWith("shell error"))
+            return "error: 读不到通讯录(可能没有 root 或联系人库不可访问): ${raw.take(160)}"
+        // content query 每行一条:`Row: 0 display_name=张三, data1=13800138000`
+        val rows = raw.split(Regex("(?m)^Row: \\d+ ")).map { it.trim() }.filter { it.isNotEmpty() }
+        val nameRe = Regex("display_name=(.*?), data1=", RegexOption.DOT_MATCHES_ALL)
+        val numRe = Regex("data1=(.*)", RegexOption.DOT_MATCHES_ALL)
+        // 一个人常有多个号码(手机/座机),按 姓名→号码集合 归并去重,顺序保持首次出现
+        val map = LinkedHashMap<String, LinkedHashSet<String>>()
+        for (row in rows) {
+            val dn = nameRe.find(row)?.groupValues?.get(1)?.trim() ?: continue
+            val num = numRe.find(row)?.groupValues?.get(1)?.trim()?.replace(" ", "") ?: continue
+            if (dn.isEmpty() || num.isEmpty() || num == "NULL") continue
+            if (name.isNotEmpty() && !dn.contains(name, true)) continue
+            // 姓名筛完再判上限:留空时才靠这个截断,带 name 时要把同名多号都收齐
+            if (name.isEmpty() && dn !in map && map.size >= limit) break
+            map.getOrPut(dn) { LinkedHashSet() }.add(num)
+        }
+        if (map.isEmpty())
+            return if (name.isEmpty()) "通讯录是空的" else "通讯录里没有匹配「$name」的联系人"
+        return map.entries.joinToString("\n") { (dn, nums) ->
+            "$dn：${nums.joinToString("、")}"
+        }
+    }
+
     // ---------------------------------------------------------------- 文件
 
     private val readFile = Spec(
@@ -1109,6 +1269,62 @@ object Tools {
         }
     )
 
+    // ---------------------------------------------------------------- 蓝牙
+
+    /**
+     * 蓝牙开关 + 状态查询 + 列配对。**故意不做"连接指定设备"** ——
+     * stock/HyperOS 没有稳定的 shell 接口去连某个 MAC(`svc bluetooth` 只有总开关,
+     * `cmd bluetooth_manager` 各版本子命令都不一样),硬做只能在进程里反射
+     * BluetoothA2dp.connect 那类 hidden API,跨版本极脆,正是 send_message 早期
+     * "报成功实际没动"那类事故的温床。能力边界如实写进 modelHint,别让模型去许诺连设备。
+     */
+    private val bluetoothControl = Spec(
+        name = "bluetooth_control",
+        description = "开关蓝牙、查询蓝牙状态、列出已配对设备",
+        modelHint = "「打开/关闭蓝牙」→ enable/disable；「蓝牙开着吗」→ status；" +
+                "「配对过哪些蓝牙设备」→ list_paired。" +
+                "**不支持**主动连接某个具体设备(系统没有稳定接口)，只能开关和查询，" +
+                "用户要连某个耳机时如实说做不到、让他自己在设置里连。",
+        params = listOf(
+            Param("action", "string", "动作", required = true,
+                enum = listOf("enable", "disable", "status", "list_paired"))
+        ),
+        // enable/disable 才是动作类;status/list_paired 只读,未接管的轮次也该能查
+        mutatingWhen = { it.optString("action", "status").trim().lowercase() in setOf("enable", "disable") },
+        handler = { args, _ -> bluetoothControlImpl(args.optString("action", "status").trim().lowercase()) }
+    )
+
+    private fun bluetoothControlImpl(action: String): String = when (action) {
+        "enable" -> { sh("svc bluetooth enable"); "已打开蓝牙" }
+        "disable" -> { sh("svc bluetooth disable"); "已关闭蓝牙" }
+        "status" -> {
+            when (sh("settings get global bluetooth_on").trim()) {
+                "1" -> "蓝牙：开启"
+                "0" -> "蓝牙：关闭"
+                else -> "蓝牙状态未知"
+            }
+        }
+        "list_paired" -> {
+            // dumpsys 里带 MAC 的行就是已知/配对设备,格式各版本不一,统一抓「MAC + 其后的名字」。
+            // 单引号包住正则交给设备端 shell 的 grep,{}() 在单引号里都是字面量。
+            val raw = sh(
+                "dumpsys bluetooth_manager | grep -iE '([0-9a-f]{2}:){5}[0-9a-f]{2}'",
+                limit = 64 * 1024
+            )
+            val macRe = Regex("(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})\\s*(.*)")
+            val seen = LinkedHashMap<String, String>()
+            for (line in raw.lines()) {
+                val m = macRe.find(line.trim()) ?: continue
+                val mac = m.groupValues[1].uppercase()
+                if (mac in seen) continue
+                seen[mac] = m.groupValues[3].trim().trim('[', ']').trim()
+            }
+            if (seen.isEmpty()) "没有找到已配对的蓝牙设备(蓝牙可能关着，读不到列表)"
+            else seen.entries.joinToString("\n") { (mac, n) -> if (n.isEmpty()) mac else "$n（$mac）" }
+        }
+        else -> "error: 未知操作 \"$action\""
+    }
+
     // ---------------------------------------------------------------- 杂项
 
     private val currentTime = Spec(
@@ -1129,6 +1345,64 @@ object Tools {
             sh("dumpsys notification --noredact | grep -E 'pkg=|android.title=|android.text=' | head -n 60")
         }
     )
+
+    // ---------------------------------------------------------------- 剪贴板
+
+    /**
+     * 剪贴板读写。写入任何时候都稳;**读取**在 Android 10+ 被限成「前台应用/默认输入法」
+     * 才准读 —— 我们跑在小爱进程里,正常语音交互时小爱本来就在前台,所以通常读得到;
+     * 偶尔被系统按后台拦下时如实回「读不到」,不硬来(root 也绕不开这个焦点判定,
+     * 只有 service call clipboard 那种 parcel 解析,版本相关又脆,不值得)。
+     */
+    private val clipboard = Spec(
+        name = "clipboard",
+        description = "读取或写入系统剪贴板",
+        modelHint = "「我刚复制了什么」「读一下剪贴板」→ action=get；" +
+                "「把这段复制到剪贴板」「帮我复制XX」→ action=set 并给 text。" +
+                "读取偶尔会因系统后台限制失败，失败就如实说读不到，别编内容。",
+        params = listOf(
+            Param("action", "string", "get=读取；set=写入", required = true, enum = listOf("get", "set")),
+            Param("text", "string", "action=set 时要写入的文本")
+        ),
+        mutatingWhen = { it.optString("action", "get").trim().lowercase() == "set" },
+        handler = { args, ctx ->
+            if (ctx == null) return@Spec "error: no context available"
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                ?: return@Spec "error: 拿不到剪贴板服务"
+            when (args.optString("action", "get").trim().lowercase()) {
+                "set" -> {
+                    val text = args.optString("text", "")
+                    if (text.isEmpty()) return@Spec "error: set 需要 text"
+                    onMainThread(ctx) {
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("xiaoai", text))
+                        "已写入剪贴板：$text"
+                    }
+                }
+                else -> onMainThread(ctx) {
+                    if (!cm.hasPrimaryClip()) return@onMainThread "剪贴板是空的"
+                    val txt = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString()
+                    if (txt.isNullOrEmpty())
+                        "剪贴板里没有可读文本(可能是图片，或被系统按后台读取限制拦下)"
+                    else "剪贴板内容：$txt"
+                }
+            }
+        }
+    )
+
+    /**
+     * 把一段操作 marshal 到主线程同步执行。ClipboardManager 要求调用线程有 Looper,
+     * 而工具跑在 AiClient 的线程池里没有 —— 直接调会抛。超时/异常都收成错误串返回。
+     */
+    private fun onMainThread(ctx: Context, block: () -> String): String {
+        val latch = CountDownLatch(1)
+        val holder = AtomicReference("error: 剪贴板操作超时")
+        ctx.mainExecutor.execute {
+            holder.set(runCatching(block).getOrElse { "error: ${it.javaClass.simpleName}: ${it.message}" })
+            latch.countDown()
+        }
+        latch.await(3, TimeUnit.SECONDS)
+        return holder.get()
+    }
 
     // ---------------------------------------------------------------- 定位
 

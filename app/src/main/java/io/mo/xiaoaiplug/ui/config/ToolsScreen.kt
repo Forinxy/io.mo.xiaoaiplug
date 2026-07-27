@@ -21,6 +21,7 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 @Composable
@@ -115,6 +116,36 @@ fun ToolsScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
             }
         }
 
+        // run_shell 安全策略:只在 run_shell 开着时才有意义,关了就不显示这块。
+        // 索引顺序必须和 SHELL_POLICY_KEYS 对齐(0=全开 1=仅只读 2=禁用)。
+        if (Tools.RUN_SHELL in enabledNames) {
+            item { SmallTitle("run_shell 安全策略") }
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    val curIdx = SHELL_POLICY_KEYS.indexOf(
+                        Tools.ShellPolicy.fromKey(config.shellPolicy).name.lowercase()
+                    ).coerceAtLeast(0)
+                    WindowDropdownPreference(
+                        title = "shell 命令策略",
+                        summary = SHELL_POLICY_SUMMARIES[curIdx],
+                        items = SHELL_POLICY_LABELS,
+                        selectedIndex = curIdx,
+                        onSelectedIndexChange = { i ->
+                            vm.update { it.copy(shellPolicy = SHELL_POLICY_KEYS[i]) }
+                        }
+                    )
+                }
+            }
+            item {
+                Text(
+                    text = "无论哪档，格式化 / 删除系统或数据分区 / 刷机 / 重启 等毁灭性命令都会被硬拦。",
+                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 8.dp)
+                )
+            }
+        }
+
         if (readOnly.isNotEmpty()) {
             item { SmallTitle("只读") }
             item {
@@ -158,3 +189,12 @@ fun ToolsScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
         }
     }
 }
+
+// 三项一一对应,顺序即下拉索引。key 存进 config.shellPolicy(见 Tools.ShellPolicy.fromKey)。
+private val SHELL_POLICY_KEYS = listOf("full", "readonly", "disabled")
+private val SHELL_POLICY_LABELS = listOf("全开", "仅只读", "禁用")
+private val SHELL_POLICY_SUMMARIES = listOf(
+    "允许执行任意命令（写命令仍只在本模块接管本轮时才执行）",
+    "只放行查询类命令，会改设备状态的一律拒绝（推荐）",
+    "完全禁用 run_shell，模型只能用专用工具"
+)
