@@ -39,6 +39,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -52,10 +53,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.dropShadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.shadow.Shadow
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -102,6 +106,10 @@ import kotlin.math.sign
 import kotlin.math.sin
 
 private val LocalTabScale = staticCompositionLocalOf { { 1f } }
+
+// 彩蛋"水滴挣脱"的形变幅度：拽到临界时最多纵向拉长 55%、横向收窄 22%
+private const val BLOB_STRETCH_Y = 0.55f
+private const val BLOB_PINCH_X = 0.22f
 
 /** 玻璃胶囊边缘那圈镜面高光。双峰：一主一副，主光源跟着重力转。 */
 private val indicatorSpecular: Highlight = Highlight(
@@ -240,6 +248,26 @@ fun GlassNavBar(
 
     var currentIndex by remember { mutableIntStateOf(selectedIndex) }
 
+    // —— 彩蛋：往上一拽，把玻璃胶囊像水珠一样从 tab 栏里"啵"地薅出来满屏乱飞 ——
+    // 折射/模糊本来就采样铺满整屏的 backdrop，胶囊挪到哪，玻璃就吃到哪的背景，
+    // 所以「拖到任意位置也有液态玻璃」是白捡的，这里主要是把"挣脱"那口粘度做出来。
+    val hapticFeedback = LocalHapticFeedback.current
+    var detached by remember { mutableStateOf(false) }
+    val freeOffsetX = remember { Animatable(0f) }
+    // 竖直方向的原始拽动量（负=向上）：脱离前拿它算粘滞阻力和拉伸，脱离后就是跟手位移
+    val pullY = remember { Animatable(0f) }
+    // 挣脱瞬间的纵向缩放：从拉长(>1)欠阻尼弹回 1，故意抖两下，像刚断开的水珠
+    val blobScaleY = remember { Animatable(1f) }
+    // 往上拽超过这个距离才"啵"地脱离，免得正常左右滑手抖一下就飞出去
+    val detachThresholdPx = with(density) { 32.dp.toPx() }
+    // 松手回窝：欠阻尼，带一点点回弹，像橡皮筋把它嘬回去
+    val freeReturnSpec = spring<Float>(dampingRatio = 0.55f, stiffness = 260f)
+    // 挣脱回弹：更欠阻尼，抖两下才停，就是水珠断开那一颤
+    val recoilSpec = spring<Float>(dampingRatio = 0.3f, stiffness = 340f)
+    // 阈值判定用纯 var 同步累加，别用 pullY.value（那是 launch 里异步 snapTo 的，差一帧）
+    class PullTracker { var pulledY = 0f }
+    val pullTracker = remember { PullTracker() }
+
     class DampedDragHolder {
         var instance: DampedDragAnimation? = null
     }
@@ -255,6 +283,8 @@ fun GlassNavBar(
             initialScale = 1f,
             pressedScale = 78f / 56f,
             canDrag = { offset ->
+                // 脱离之后手指早飞出栏外了，边界判定得让路，否则一出栏就断触卡死
+                if (detached) return@DampedDragAnimation true
                 val anim = holder.instance ?: return@DampedDragAnimation true
                 if (tabWidthPx == 0f) return@DampedDragAnimation false
                 val indicatorX = anim.value * tabWidthPx
@@ -266,8 +296,33 @@ fun GlassNavBar(
                 }
                 globalTouchX in 0f..totalWidthPx
             },
-            onDragStarted = {},
+            onDragStarted = {
+                // 每次重新按下都从「窝里」干净起步，防止上一把回弹还没跑完就接着拖
+                detached = false
+                pullTracker.pulledY = 0f
+                animationScope.launch { pullY.snapTo(0f) }
+                animationScope.launch { freeOffsetX.snapTo(0f) }
+                animationScope.launch { blobScaleY.snapTo(1f) }
+            },
             onDragStopped = {
+                if (detached) {
+                    // 松手：橡皮筋把水珠嘬回原来那个 tab，绝不顺手改选中页。
+                    // detached 故意留到 pullY 归零才解除 —— 中途切成"黏着"公式会让缩放突跳
+                    animationScope.launch { freeOffsetX.animateTo(0f, freeReturnSpec) }
+                    animationScope.launch { blobScaleY.animateTo(1f, freeReturnSpec) }
+                    animationScope.launch {
+                        pullY.animateTo(0f, freeReturnSpec)
+                        detached = false
+                    }
+                    animateToValue(currentIndex.toFloat())
+                    animationScope.launch {
+                        offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
+                    }
+                    return@DampedDragAnimation
+                }
+                // 没拽到脱离就松手：把可能已经拉起来的水滴收回栏里，别僵在半路
+                pullTracker.pulledY = 0f
+                animationScope.launch { pullY.animateTo(0f, freeReturnSpec) }
                 val targetIndex = targetValue.roundToInt().coerceIn(0, tabsCount - 1)
                 if (currentIndex != targetIndex) {
                     currentIndex = targetIndex
@@ -279,13 +334,31 @@ fun GlassNavBar(
                 }
             },
             onDrag = { _, dragAmount ->
-                if (tabWidthPx > 0f) {
-                    updateValue(
-                        (targetValue + dragAmount.x / tabWidthPx * if (isLtr) 1f else -1f)
-                            .coerceIn(0f, (tabsCount - 1).toFloat())
-                    )
-                    animationScope.launch {
-                        offsetAnimation.snapTo(offsetAnimation.value + dragAmount.x)
+                if (detached) {
+                    // 已脱离：横轴自由跟手，纵轴继续累到 pullY，想飞哪飞哪
+                    pullTracker.pulledY += dragAmount.y
+                    animationScope.launch { pullY.snapTo(pullTracker.pulledY) }
+                    animationScope.launch { freeOffsetX.snapTo(freeOffsetX.value + dragAmount.x) }
+                } else {
+                    pullTracker.pulledY += dragAmount.y
+                    animationScope.launch { pullY.snapTo(pullTracker.pulledY) }
+                    if (-pullTracker.pulledY > detachThresholdPx) {
+                        // 表面张力崩了！啵一下挣脱：从拉长态回弹成圆珠，抖两下
+                        detached = true
+                        hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                        animationScope.launch { freeOffsetX.snapTo(0f) }
+                        animationScope.launch {
+                            blobScaleY.snapTo(1f + BLOB_STRETCH_Y)
+                            blobScaleY.animateTo(1f, recoilSpec)
+                        }
+                    } else if (tabWidthPx > 0f) {
+                        updateValue(
+                            (targetValue + dragAmount.x / tabWidthPx * if (isLtr) 1f else -1f)
+                                .coerceIn(0f, (tabsCount - 1).toFloat())
+                        )
+                        animationScope.launch {
+                            offsetAnimation.snapTo(offsetAnimation.value + dragAmount.x)
+                        }
                     }
                 }
             }
@@ -487,8 +560,24 @@ fun GlassNavBar(
                             .graphicsLayer {
                                 val progressOffset = dampedDrag.value * tabWidthPx
                                 translationX =
-                                    if (isLtr) progressOffset + panelOffset
-                                    else -progressOffset + panelOffset
+                                    (if (isLtr) progressOffset + panelOffset
+                                    else -progressOffset + panelOffset) + freeOffsetX.value
+                                val up = -pullY.value
+                                if (detached) {
+                                    // 已挣脱：纵向跟手飞，缩放交给回弹动画去颤
+                                    translationY = pullY.value
+                                    transformOrigin = TransformOrigin.Center
+                                    scaleY = blobScaleY.value
+                                    scaleX = 1f / blobScaleY.value.coerceAtLeast(0.2f)
+                                } else {
+                                    // 还黏在栏上：手指拉得多、胶囊挪得少(先黏后松的表面张力)，
+                                    // 同时被抻成水滴 —— 纵向拉长、横向收窄，锚在底边朝手指方向抻
+                                    val p = (up / detachThresholdPx).coerceIn(0f, 1f)
+                                    translationY = -up * lerp(0.35f, 0.8f, p)
+                                    transformOrigin = TransformOrigin(0.5f, 1f)
+                                    scaleY = 1f + BLOB_STRETCH_Y * p
+                                    scaleX = 1f - BLOB_PINCH_X * p
+                                }
                             }
                             .then(interactiveHighlight.gestureModifier)
                             .then(dampedDrag.modifier)
@@ -545,8 +634,15 @@ fun GlassNavBar(
                             .graphicsLayer {
                                 val progressOffset = dampedDrag.value * tabWidthPx
                                 translationX =
-                                    if (isLtr) progressOffset + panelOffset
-                                    else -progressOffset + panelOffset
+                                    (if (isLtr) progressOffset + panelOffset
+                                    else -progressOffset + panelOffset) + freeOffsetX.value
+                                // 无 shader 没折射，水滴形变意义不大，只保留粘滞位移
+                                val up = -pullY.value
+                                translationY = if (detached) {
+                                    pullY.value
+                                } else {
+                                    -up * lerp(0.35f, 0.8f, (up / detachThresholdPx).coerceIn(0f, 1f))
+                                }
                             }
                             .then(dampedDrag.modifier)
                             .clip(pillShape)
