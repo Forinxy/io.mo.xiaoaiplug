@@ -1,5 +1,7 @@
 package io.mo.xiaoaiplug.config
 
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.location.Address
 import android.location.Geocoder
@@ -1272,29 +1274,55 @@ object Tools {
     // ---------------------------------------------------------------- 蓝牙
 
     /**
-     * 蓝牙开关 + 状态查询 + 列配对。**故意不做"连接指定设备"** ——
-     * stock/HyperOS 没有稳定的 shell 接口去连某个 MAC(`svc bluetooth` 只有总开关,
-     * `cmd bluetooth_manager` 各版本子命令都不一样),硬做只能在进程里反射
-     * BluetoothA2dp.connect 那类 hidden API,跨版本极脆,正是 send_message 早期
-     * "报成功实际没动"那类事故的温床。能力边界如实写进 modelHint,别让模型去许诺连设备。
+     * 蓝牙开关 + 状态查询 + 列配对 + 电量 + 连接/断开指定耳机。
+     *
+     * connect/disconnect 曾**故意不做** —— stock 上 `svc bluetooth` 只有总开关。这里走
+     * 框架标准隐藏 API [BluetoothDevice.connect]/[disconnect](Android 13+ @SystemApi,一次
+     * 连/断该设备所有已启用 profile,需 BLUETOOTH_PRIVILEGED),而工具跑在的 com.miui.voiceassist
+     * 实测就持有这个权限(dumpsys 确认 granted=true),所以能真断音频。
+     *
+     * 走了弯路才定这条:先试过小米私有 AIDL(绑 com.xiaomi.bluetooth 的 BluetoothHeadsetService、
+     * transact IMiuiHeadsetService.disconnect),真机验证 transact 不报错但**耳机根本不断** ——
+     * 它只动自己那套 MMA/插件会话,不碰 A2DP/HFP。别再回头走那条。
+     *
+     * **不做 ANC/降噪切换**:实测那条路不走这个干净 binder,而是走动态下载的插件/云配置,
+     * mode 的 int 值按机型漂移、连运行时都抓不稳,硬做就是"报成功实际没动"。
+     *
+     * connect 在蓝牙层是**异步**的,发起后不代表已连上,返回话术只说"已发起"、让用户确认,
+     * 不许诺"已连接"。battery 走小米私有 ContentProvider `com.android.bluetooth.deviceinfo_provider`
+     * (`content query` 稳定接口),非小米 ROM 上查不到时如实回"读不到"而不是编。
      */
     private val bluetoothControl = Spec(
         name = "bluetooth_control",
-        description = "开关蓝牙、查询蓝牙状态、列出已配对设备",
+        description = "开关蓝牙、查询蓝牙状态、列出已配对设备、查蓝牙设备电量、连接/断开指定耳机",
         modelHint = "「打开/关闭蓝牙」→ enable/disable；「蓝牙开着吗」→ status；" +
-                "「配对过哪些蓝牙设备」→ list_paired。" +
-                "**不支持**主动连接某个具体设备(系统没有稳定接口)，只能开关和查询，" +
-                "用户要连某个耳机时如实说做不到、让他自己在设置里连。",
+                "「配对过哪些蓝牙设备」→ list_paired；" +
+                "「耳机/蓝牙设备还有多少电」「左右耳电量」→ battery；" +
+                "「连接/断开我的耳机」→ connect/disconnect，device 传设备名关键词或 MAC" +
+                "（如「连接 Redmi Buds」→ connect device=Redmi Buds）。" +
+                "connect 是异步发起，返回「已发起」不等于已连上，别向用户打包票说「已连接」。" +
+                "**不支持**切降噪/通透（ANC）——如实说做不到、让用户自己在耳机设置里切。",
         params = listOf(
             Param("action", "string", "动作", required = true,
-                enum = listOf("enable", "disable", "status", "list_paired"))
+                enum = listOf("enable", "disable", "status", "list_paired", "battery", "connect", "disconnect")),
+            Param("device", "string", "要连接/断开的设备：MAC 或名字关键词，仅 connect/disconnect 用",
+                required = false)
         ),
-        // enable/disable 才是动作类;status/list_paired 只读,未接管的轮次也该能查
-        mutatingWhen = { it.optString("action", "status").trim().lowercase() in setOf("enable", "disable") },
-        handler = { args, _ -> bluetoothControlImpl(args.optString("action", "status").trim().lowercase()) }
+        // 会改变设备状态的才算动作类;status/list_paired/battery 只读,未接管的轮次也该能查
+        mutatingWhen = {
+            it.optString("action", "status").trim().lowercase() in
+                    setOf("enable", "disable", "connect", "disconnect")
+        },
+        handler = { args, ctx ->
+            bluetoothControlImpl(
+                args.optString("action", "status").trim().lowercase(),
+                args.optString("device").trim(),
+                ctx
+            )
+        }
     )
 
-    private fun bluetoothControlImpl(action: String): String = when (action) {
+    private fun bluetoothControlImpl(action: String, device: String, ctx: Context?): String = when (action) {
         "enable" -> { sh("svc bluetooth enable"); "已打开蓝牙" }
         "disable" -> { sh("svc bluetooth disable"); "已关闭蓝牙" }
         "status" -> {
@@ -1322,7 +1350,139 @@ object Tools {
             if (seen.isEmpty()) "没有找到已配对的蓝牙设备(蓝牙可能关着，读不到列表)"
             else seen.entries.joinToString("\n") { (mac, n) -> if (n.isEmpty()) mac else "$n（$mac）" }
         }
+        "battery" -> bluetoothBattery()
+        "connect", "disconnect" -> {
+            if (ctx == null) "error: 没有 Context，连不了设备"
+            else if (device.isEmpty()) "error: 要连/断哪个设备？给个名字关键词或 MAC（先用 list_paired 看看有哪些）"
+            else {
+                val (dev, err) = resolveBondedDevice(device)
+                if (dev == null) err
+                else {
+                    val r = btConnectDisconnect(dev, action == "connect")
+                    val label = (dev.name?.takeIf { it.isNotBlank() } ?: dev.address)
+                    when {
+                        r.isNotEmpty() -> r
+                        action == "connect" -> "已向 $label 发起连接，请留意耳机是否连上（异步，可能要一两秒；没连上多半是耳机没在待连状态）"
+                        else -> "已向 $label 发起断开"
+                    }
+                }
+            }
+        }
         else -> "error: 未知操作 \"$action\""
+    }
+
+    // 走框架标准 API 连/断:BluetoothDevice.connect()/disconnect() 是 Android 13+ 的 @SystemApi
+    // 隐藏方法,一次连/断该设备所有已启用 profile,需 BLUETOOTH_PRIVILEGED —— 而工具跑在的
+    // com.miui.voiceassist 实测 granted=true(dumpsys package 确认)。
+    // **为什么不用小米私有的 IMiuiHeadsetService.connect/disconnect**:真机验证过那条路
+    // transact 不报错但耳机根本不断(它只管自己那套 MMA/插件会话,不动 A2DP/HFP)。
+    // 返回值是 BluetoothStatusCodes,0=SUCCESS。
+
+    /**
+     * 在已配对设备里按 MAC(精确)或名字(子串,忽略大小写)解析出一个 BluetoothDevice。
+     * 返回 (设备, 错误话术);设备为 null 时第二个是给用户看的原因。
+     */
+    private fun resolveBondedDevice(query: String): Pair<BluetoothDevice?, String> {
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+            ?: return null to "error: 取不到蓝牙适配器"
+        if (!adapter.isEnabled) return null to "蓝牙没开，先打开蓝牙再连"
+        val bonded = try {
+            adapter.bondedDevices
+        } catch (e: SecurityException) {
+            return null to "error: 读不到已配对设备（缺 BLUETOOTH_CONNECT 权限）"
+        } ?: return null to "error: 读不到已配对设备列表"
+
+        val q = query.trim()
+        if (Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}").matches(q)) {
+            val d = bonded.firstOrNull { it.address.equals(q, ignoreCase = true) }
+            return if (d != null) d to "" else null to "没找到已配对设备 $q"
+        }
+        val matches = bonded.filter { (it.name ?: "").contains(q, ignoreCase = true) }
+        return when {
+            matches.isEmpty() ->
+                null to "没找到名字含「$q」的已配对设备，用 list_paired 看看有哪些。"
+            matches.size > 1 ->
+                null to ("「$q」匹配到多个设备：" +
+                        matches.joinToString("、") { it.name ?: it.address } +
+                        "，说得更具体点或直接给 MAC。")
+            else -> matches[0] to ""
+        }
+    }
+
+    /**
+     * 反射调 BluetoothDevice.connect()/disconnect()(隐藏 @SystemApi)。返回空串=成功;
+     * 非空=错误话术。connect 是**异步**的:返回 SUCCESS 只代表命令受理,真连上还要一两秒。
+     */
+    private fun btConnectDisconnect(device: BluetoothDevice, connect: Boolean): String {
+        val method = if (connect) "connect" else "disconnect"
+        return try {
+            val ret = BluetoothDevice::class.java.getMethod(method).invoke(device)
+            // Android 13+ 返回 int(BluetoothStatusCodes),0=SUCCESS;老版本可能是 void/boolean
+            when (ret) {
+                null -> ""                      // void:没抛异常即视为受理
+                is Int -> if (ret == 0) "" else "error: 系统拒绝了${if (connect) "连接" else "断开"}（状态码 $ret）"
+                is Boolean -> if (ret) "" else "error: 系统未受理${if (connect) "连接" else "断开"}请求"
+                else -> ""
+            }
+        } catch (e: NoSuchMethodException) {
+            "error: 这台系统没有 BluetoothDevice.$method（版本太老），连/断指定设备做不了"
+        } catch (e: Exception) {
+            val c = (e.cause ?: e)
+            "error: ${if (connect) "连接" else "断开"}失败：${c.javaClass.simpleName}: ${c.message}"
+        }
+    }
+
+    /**
+     * 读小米私有 Provider 的设备电量。`content query` 输出是
+     * `Row: N key=value, key=value, ...`,逐行拆成 map 再格式化。
+     * battery/left/right/box 里 -1(或空)表示该项无效,过滤掉只留真实数值。
+     */
+    private fun bluetoothBattery(): String {
+        val raw = sh(
+            "content query --uri content://com.android.bluetooth.deviceinfo_provider/deviceinfo",
+            limit = 32 * 1024
+        )
+        // Provider 不存在 / 无权限时 content 会打印 Error 或 No result found
+        if (raw.contains("No result found", ignoreCase = true))
+            return "没有已连接的蓝牙设备,或系统未记录电量"
+        if (raw.contains("Error", ignoreCase = true) || raw.contains("Exception"))
+            return "读不到蓝牙设备电量(这台 ROM 可能没有小米的电量 Provider)"
+
+        val lines = raw.lines().filter { it.trimStart().startsWith("Row:") }
+        if (lines.isEmpty()) return "没有已连接的蓝牙设备,或系统未记录电量"
+
+        val out = StringBuilder()
+        for (line in lines) {
+            val body = line.substringAfter("Row:").trim().substringAfter(' ', "").ifEmpty {
+                line.substringAfter("Row:").trim()
+            }
+            // content query 用 ", " 分隔各 key=value
+            val kv = HashMap<String, String>()
+            for (pair in body.split(", ")) {
+                val i = pair.indexOf('=')
+                if (i > 0) kv[pair.substring(0, i).trim()] = pair.substring(i + 1).trim()
+            }
+            val name = kv["name"]?.takeIf { it.isNotBlank() && it != "NULL" }
+            val addr = kv["address"]?.takeIf { it.isNotBlank() && it != "NULL" }
+            val title = name ?: addr ?: continue
+
+            fun pct(key: String): Int? =
+                kv[key]?.trim()?.toIntOrNull()?.takeIf { it in 0..100 }
+
+            val parts = buildList {
+                pct("left")?.let { add("左耳 $it%") }
+                pct("right")?.let { add("右耳 $it%") }
+                pct("box")?.let { add("充电盒 $it%") }
+                // 单体设备(非 TWS)用 battery;已经有左右耳时它一般是无效值,不重复
+                if (none { it.startsWith("左耳") || it.startsWith("右耳") })
+                    pct("battery")?.let { add("电量 $it%") }
+            }
+            out.append(if (name != null && addr != null) "$name（$addr）" else title)
+            out.append("：").append(if (parts.isEmpty()) "电量未知" else parts.joinToString("  "))
+            out.append('\n')
+        }
+        val text = out.toString().trim()
+        return text.ifEmpty { "没有已连接的蓝牙设备,或系统未记录电量" }
     }
 
     // ---------------------------------------------------------------- 杂项

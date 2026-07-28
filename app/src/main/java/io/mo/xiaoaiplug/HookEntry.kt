@@ -179,6 +179,14 @@ private val KILL_BG_STRONG = Regex("(强制|强行)(停止|关闭|关掉|退出|
 // 但不触发小爱的"清后台动画"(那只跟杀/清后台绑,见 [ownsKillTurnNow])。
 private val APP_CTRL_PATTERN = Regex("冻结|解冻|清(理|除|一下|一下子)?(缓存|垃圾)")
 
+// 「连接/断开某个蓝牙设备(耳机等)」类指令。和杀后台/发消息类一样**必须由我们接管**才能放行
+// bluetooth_control 的 connect/disconnect 动作闸 —— 小爱原生连不了指定设备(连某个 MAC 系统没
+// 稳定接口,正是这个工具存在的理由)。判据仿杀后台:连/断动词 + 蓝牙设备锚点,双命中才算,
+// 避免"连接WiFi""连上电脑"这类误伤;问句(怎么/如何…)不接管。
+private val BT_CONN_VERBS = listOf("连接", "连上", "连一下", "连下", "接上", "断开", "断掉", "断连")
+private val BT_CONN_ANCHORS = listOf("蓝牙", "耳机", "耳麦", "耳塞", "buds", "headset", "音箱", "音响")
+private val BT_CONN_QUESTION = Regex("怎么|如何|怎样|为什么")
+
 // 判定"跳转目标确实是系统设置/系统应用",避免误伤导航/打开第三方应用之类的正常跳转
 class HookEntry : IXposedHookLoadPackage {
 
@@ -749,6 +757,14 @@ class HookEntry : IXposedHookLoadPackage {
     private fun isAppControlCommand(q: String): Boolean =
         q.isNotBlank() && APP_CTRL_PATTERN.containsMatchIn(q)
 
+    /** 是不是"连接/断开蓝牙设备"类。命中即接管、放行 bluetooth_control 的 connect/disconnect。 */
+    private fun isBtConnectCommand(q: String): Boolean {
+        if (q.isBlank() || BT_CONN_QUESTION.containsMatchIn(q)) return false
+        val hasVerb = BT_CONN_VERBS.any { q.contains(it, ignoreCase = true) }
+        val hasAnchor = BT_CONN_ANCHORS.any { q.contains(it, ignoreCase = true) }
+        return hasVerb && hasAnchor
+    }
+
     /**
      * 这一轮交互归不归我们 —— 所有"要不要拦"的判定都问这一个问题。
      *
@@ -812,6 +828,10 @@ class HookEntry : IXposedHookLoadPackage {
     /** 「这轮是不是冻结/清缓存类」的当下判定。 */
     private fun appControlCommandNow(): Boolean =
         currentQueryTexts().any { isAppControlCommand(it) }
+
+    /** 「这轮是不是连接/断开蓝牙设备类」的当下判定。 */
+    private fun btConnectCommandNow(): Boolean =
+        currentQueryTexts().any { isBtConnectCommand(it) }
 
     /**
      * 这轮是不是"我们已接管的杀后台"。用来决定要不要拦小爱那下"按最近任务键"的原生动作
@@ -1568,6 +1588,13 @@ class HookEntry : IXposedHookLoadPackage {
                         session(dialogId).pendingViewAnswer = true
                         if (config.speakAnswer) startMutePump(dialogId)
                         Log.i(TAG, "app-control command, taking over: $queryText")
+                    }
+                    // 连接/断开蓝牙设备类:小爱原生连不了指定设备,接管以放行 bluetooth_control 的
+                    // connect/disconnect 动作闸(否则被 Tools.execute 拦成"未接管")。
+                    if (btConnectCommandNow()) {
+                        session(dialogId).pendingViewAnswer = true
+                        if (config.speakAnswer) startMutePump(dialogId)
+                        Log.i(TAG, "bt-connect command, taking over: $queryText")
                     }
                     // queryText 非 null = 这个 dialogId 已处理过。存在性即去重判据,所以用可空而非空串。
                     if (sessionOrNull(dialogId)?.queryText != null) return
