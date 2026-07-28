@@ -26,6 +26,15 @@ class UpdateCheckerTest {
     }
 
     @Test
+    fun `序号前缀的tag取真正的版本段`() {
+        // 线上出过的形态：tag=「2-1.0.2」，前面的 2 只是发布序号，版本是 1.0.2。
+        // 旧实现在 '-' 处截断会归一成 "2"，比谁都大 → 装了 1.0.5 也永远弹更新。
+        assertEquals("1.0.2", UpdateChecker.normalizeVersion("2-1.0.2"))
+        assertEquals("1.0.2", UpdateChecker.normalizeVersion("v2-1.0.2"))
+        assertTrue(UpdateChecker.compareVersion(UpdateChecker.normalizeVersion("2-1.0.2"), "1.0.5") < 0)
+    }
+
+    @Test
     fun `版本比较逐段比数字`() {
         assertTrue(UpdateChecker.compareVersion("1.0.5", "1.0.4") > 0)
         assertTrue(UpdateChecker.compareVersion("1.1.0", "1.0.9") > 0)

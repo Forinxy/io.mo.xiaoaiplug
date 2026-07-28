@@ -166,19 +166,26 @@ object UpdateChecker {
 
     // ---- 下面几个是纯逻辑，internal 是为了 src/test 里能直接测 ----
 
+    /** 数字点串：`1`、`1.0`、`1.0.5`。tag 里能有好几处（`2-1.0.2` 就有 `2` 和 `1.0.2`）。 */
+    private val VERSION_RUN = Regex("\\d+(?:\\.\\d+)*")
+
     /**
-     * `v1.0.5` / `V1.0.5-beta.2` / `1.0.5+build7` → `1.0.5`。
+     * 从 tag 里抠出真正的版本号：`v1.0.5` / `V1.0.5-beta.2` / `1.0.5+build7` / `2-1.0.2` → `1.0.5`（末例 `1.0.2`）。
      *
-     * 预发布后缀直接砍掉而不是参与比较：`/releases/latest` 根本不会返回 prerelease，
-     * 留着后缀只会让 `1.0.5-rc1` 被算成比 `1.0.5` 大。
+     * 不能简单地「在 `-` 处截断留前半段」：tag 命名有两种相反的形态——
+     *  - `1.0.5-beta.2`：版本在前，`-` 后是预发布后缀，该丢后半段；
+     *  - `2-1.0.2`：`-` 前只是发布序号，版本在后，该丢前半段。
+     * 一刀切会把 `2-1.0.2` 归一成 `2`，比谁都大，于是永远误报有新版。
+     *
+     * 改成扫出 tag 里所有数字点串，取**分段最多**的那个（并列取靠前的）：
+     * `2-1.0.2` 里 `1.0.2`（3 段）胜过 `2`（1 段），`1.0.5-beta.2` 里 `1.0.5` 胜过 `2`。
+     * 一个数字都没有（`nightly`、空串）→ 空串，交给上层当「读不到版本」。
      */
     internal fun normalizeVersion(raw: String): String =
-        raw.trim()
-            .removePrefix("v").removePrefix("V")
-            .substringBefore('-')
-            .substringBefore('+')
-            .filter { it.isDigit() || it == '.' }
-            .trim('.')
+        VERSION_RUN.findAll(raw)
+            .map { it.value }
+            .maxByOrNull { it.count { c -> c == '.' } }
+            ?: ""
 
     /** 逐段比数字。段数不等时缺的段按 0 算，于是 `1.1` == `1.1.0`。 */
     internal fun compareVersion(a: String, b: String): Int {
