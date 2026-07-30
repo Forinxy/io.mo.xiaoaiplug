@@ -141,6 +141,73 @@ object Tools {
 
     fun isEnabled(csv: String, name: String): Boolean = enabled(csv).any { it.name == name }
 
+    /** 将 MCP 远程工具转换为本模块的 Spec */
+    fun mcpToolToSpec(tool: McpTool, server: McpServerConfig): Spec {
+        val sanitizedServer = server.name.replace(Regex("[^a-zA-Z0-9_]"), "_").lowercase()
+        val sanitizedTool = tool.name.replace(Regex("[^a-zA-Z0-9_]"), "_")
+        val specName = "mcp_${sanitizedServer}_$sanitizedTool".take(64)
+
+        val params = mutableListOf<Param>()
+        val props = tool.inputSchema.optJSONObject("properties")
+        val requiredArr = tool.inputSchema.optJSONArray("required")
+        val requiredSet = mutableSetOf<String>()
+        if (requiredArr != null) {
+            for (i in 0 until requiredArr.length()) {
+                requiredSet.add(requiredArr.getString(i))
+            }
+        }
+        if (props != null) {
+            for (k in props.keys()) {
+                val pObj = props.getJSONObject(k)
+                val type = pObj.optString("type", "string")
+                val desc = pObj.optString("description", "")
+                val enumArr = pObj.optJSONArray("enum")
+                val enumList = if (enumArr != null) {
+                    List(enumArr.length()) { enumArr.getString(it) }
+                } else null
+                params.add(Param(k, type, desc, k in requiredSet, enumList))
+            }
+        }
+
+        return Spec(
+            name = specName,
+            description = "[MCP: ${server.name}] ${tool.description.ifEmpty { tool.name }}",
+            modelHint = "来源于 MCP 服务 ${server.name}",
+            params = params,
+            mutating = false,
+            handler = { args, _ ->
+                McpClient.callTool(server, tool.name, args)
+            }
+        )
+    }
+
+    /** 获取所有生效的内置工具和 MCP 工具 */
+    fun allSpecs(csv: String, mcpServers: List<McpServerConfig>): List<Spec> {
+        val builtIn = enabled(csv)
+        val mcpSpecs = mutableListOf<Spec>()
+        for (server in mcpServers) {
+            if (!server.enabled) continue
+            val tools = McpClient.getToolsCached(server)
+            for (tool in tools) {
+                mcpSpecs.add(mcpToolToSpec(tool, server))
+            }
+        }
+        return builtIn + mcpSpecs
+    }
+
+    fun findSpec(name: String, mcpServers: List<McpServerConfig> = emptyList()): Spec? {
+        byName[name]?.let { return it }
+        for (server in mcpServers) {
+            if (!server.enabled) continue
+            val tools = McpClient.getToolsCached(server)
+            for (tool in tools) {
+                val spec = mcpToolToSpec(tool, server)
+                if (spec.name == name) return spec
+            }
+        }
+        return null
+    }
+
     /**
      * 开/关单个工具,返回新的 csv。
      *
@@ -250,10 +317,11 @@ object Tools {
         args: JSONObject,
         ctx: Context?,
         allowMutating: Boolean = true,
-        shellPolicy: ShellPolicy = ShellPolicy.FULL
+        shellPolicy: ShellPolicy = ShellPolicy.FULL,
+        mcpServers: List<McpServerConfig> = emptyList()
     ): String {
-        val spec = byName[name]
-            ?: return "error: unknown tool \"$name\"; available: ${byName.keys.joinToString(",")}"
+        val spec = findSpec(name, mcpServers)
+            ?: return "error: unknown tool \"$name\""
         // run_shell 单独过一道策略闸(它是唯一接受任意命令串的工具)。这道闸在 allowMutating
         // 之前:毁灭性命令即使在接管轮、即使策略全开,也一律硬拦。
         if (name == RUN_SHELL) {

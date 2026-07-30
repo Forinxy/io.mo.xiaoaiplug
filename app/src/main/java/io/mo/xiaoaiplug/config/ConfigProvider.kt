@@ -47,6 +47,9 @@ object ConfigKeys {
     // 无障碍被 MIUI 摘掉后自动写回(见 AccessibilityGuard)。默认开。
     const val AUTO_FIX_ACCESSIBILITY = "auto_fix_accessibility"
 
+    // MCP 远程服务列表 JSON 字符串
+    const val MCP_SERVERS = "mcp_servers"
+
     val ALL = listOf(
         PROVIDER, ENDPOINT, API_KEY, MODEL, SYSTEM_PROMPT, ENABLED,
         BLOCK_VIEW_JUMP, JUMP_ALLOW_WORDS,
@@ -54,7 +57,8 @@ object ConfigKeys {
         SPEAK_ANSWER,
         ENABLED_TOOLS, SHELL_POLICY, USE_NATIVE_TOOLS, CONTEXT_ENABLED,
         SKIP_TAKEOVER_ENABLED, SKIP_TAKEOVER_PATTERN,
-        AUTO_FIX_ACCESSIBILITY
+        AUTO_FIX_ACCESSIBILITY,
+        MCP_SERVERS
     )
 }
 

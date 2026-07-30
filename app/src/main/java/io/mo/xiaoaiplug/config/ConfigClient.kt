@@ -41,8 +41,13 @@ data class AiConfig(
     val skipTakeoverPattern: String = DEFAULT_SKIP_TAKEOVER_PATTERN,
     // 无障碍被 MIUI 清后台摘掉后自动写回。见 AccessibilityGuard。
     // **默认关**:它要动系统设置、要 root,不该在用户没点头之前就自己开着。
-    val autoFixAccessibility: Boolean = false
+    val autoFixAccessibility: Boolean = false,
+    // MCP 服务列表 JSON 字符串
+    val mcpServersRaw: String = ""
 ) {
+    /** 解析后的 MCP 服务配置列表 */
+    val mcpServers: List<McpServerConfig> get() = McpServerConfig.parseList(mcpServersRaw)
+
     /** 当前服务商。旧存档(provider 为空)落到 [AiProvider.DEFAULT]。 */
     val aiProvider: AiProvider get() = AiProvider.fromKey(provider)
 
@@ -141,7 +146,8 @@ object ConfigClient {
             // (SharedPreferences.getString 的 defValue 只在 key 不存在时生效),这里不用再猜。
             skipTakeoverPattern = result?.getString(ConfigKeys.SKIP_TAKEOVER_PATTERN).orEmpty(),
             // 注意这里不是「空即开」—— 默认关，只有显式存过 "true" 才算开。
-            autoFixAccessibility = autoFixRaw == "true"
+            autoFixAccessibility = autoFixRaw == "true",
+            mcpServersRaw = result?.getString(ConfigKeys.MCP_SERVERS).orEmpty()
         )
     }
 
@@ -166,6 +172,7 @@ object ConfigClient {
             putString(ConfigKeys.SKIP_TAKEOVER_ENABLED, config.skipTakeoverEnabled.toString())
             putString(ConfigKeys.SKIP_TAKEOVER_PATTERN, config.skipTakeoverPattern)
             putString(ConfigKeys.AUTO_FIX_ACCESSIBILITY, config.autoFixAccessibility.toString())
+            putString(ConfigKeys.MCP_SERVERS, config.mcpServersRaw)
         }
         return try {
             val out = context.contentResolver.call(uri, ConfigProvider.METHOD_SET, null, extras)

@@ -28,7 +28,7 @@ import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 
 /** 配置 tab 的二级页。null 表示停在入口列表。 */
-enum class ConfigRoute { AI, INTERCEPT, SPEAK, TOOLS, MEMORY }
+enum class ConfigRoute { AI, INTERCEPT, SPEAK, TOOLS, MEMORY, MCP }
 
 @Composable
 fun ConfigTab(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
@@ -58,6 +58,7 @@ fun ConfigTab(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
             ConfigRoute.SPEAK -> SpeakScreen(vm, bottomInset) { route = null }
             ConfigRoute.TOOLS -> ToolsScreen(vm, bottomInset) { route = null }
             ConfigRoute.MEMORY -> MemoryScreen(vm, bottomInset, onBack = { route = null })
+            ConfigRoute.MCP -> McpScreen(vm, bottomInset) { route = null }
         }
     }
 }
@@ -72,6 +73,8 @@ private fun ConfigList(
 
     val enabledToolCount = Tools.enabled(config.enabledTools).size
     val interceptCount = listOf(config.blockViewJump, config.blockWebSearch, config.skipTakeoverEnabled).count { it }
+    val mcpCount = config.mcpServers.size
+    val enabledMcpCount = config.mcpServers.count { it.enabled }
 
     PageScaffold(title = "配置", bottomInset = bottomInset) {
         item { SmallTitle("接管") }
@@ -103,6 +106,11 @@ private fun ConfigList(
                     title = "工具",
                     summary = "$enabledToolCount/${Tools.ALL.size} 已启用",
                     onClick = { onOpen(ConfigRoute.TOOLS) }
+                )
+                ArrowPreference(
+                    title = "MCP 服务",
+                    summary = "实验性功能 · " + if (mcpCount == 0) "未配置" else "$enabledMcpCount/$mcpCount 已启用",
+                    onClick = { onOpen(ConfigRoute.MCP) }
                 )
                 ArrowPreference(
                     title = "记忆",

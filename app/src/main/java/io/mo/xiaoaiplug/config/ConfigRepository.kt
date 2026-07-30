@@ -105,6 +105,7 @@ class ConfigRepository private constructor(context: Context) {
         contextEnabled = true,
         skipTakeoverEnabled = true,
         skipTakeoverPattern = DEFAULT_SKIP_TAKEOVER_PATTERN,
-        autoFixAccessibility = false
+        autoFixAccessibility = false,
+        mcpServersRaw = ""
     )
 }

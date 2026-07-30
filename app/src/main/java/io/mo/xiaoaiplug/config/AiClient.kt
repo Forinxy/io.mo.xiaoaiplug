@@ -147,7 +147,7 @@ object AiClient {
         allowMutating: () -> Boolean,
         steps: MutableList<Pair<String, Long>>
     ): String {
-        val specs = Tools.enabled(config.enabledTools)
+        val specs = Tools.allSpecs(config.enabledTools, config.mcpServers)
         val useNative = config.useNativeTools && nativeToolsSupported && specs.isNotEmpty()
         // 模型说"我没有这个能力"时,必须能一眼分清是**没给它工具**还是**给了它没用** ——
         // 光看答案分不出来,只能靠猜。
@@ -215,7 +215,7 @@ object AiClient {
             messages.put(reply)
 
             val toolAt = System.currentTimeMillis()
-            val results = runCallsParallel(calls, ctx, iter, allowMutating, config.effectiveShellPolicy)
+            val results = runCallsParallel(calls, ctx, iter, allowMutating, config.effectiveShellPolicy, config.mcpServers)
             steps.add(
                 (if (calls.size == 1) "工具" else "工具×${calls.size}")
                         to System.currentTimeMillis() - toolAt
@@ -252,19 +252,20 @@ object AiClient {
     /** 并行执行本轮所有工具,返回与 calls 同序的结果。 */
     private fun runCallsParallel(
         calls: List<Call>, ctx: Context?, iter: Int, allowMutating: () -> Boolean,
-        shellPolicy: Tools.ShellPolicy
+        shellPolicy: Tools.ShellPolicy,
+        mcpServers: List<McpServerConfig> = emptyList()
     ): List<String> {
         if (calls.size == 1) {
             val c = calls[0]
             val t0 = System.currentTimeMillis()
-            val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy)
+            val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy, mcpServers)
             logCall(iter, c, t0, r, ctx)
             return listOf(r)
         }
         val futures = calls.map { c ->
             val t0 = System.currentTimeMillis()
             toolPool.submit<String> {
-                val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy)
+                val r = Tools.execute(c.name, c.args, ctx, allowMutating(), shellPolicy, mcpServers)
                 logCall(iter, c, t0, r, ctx)
                 r
             }
