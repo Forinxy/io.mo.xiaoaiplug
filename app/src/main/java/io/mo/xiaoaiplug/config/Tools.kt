@@ -7,6 +7,7 @@ import android.location.Address
 import android.location.Geocoder
 import android.location.Location
 import android.location.LocationManager
+import android.net.Uri
 import android.os.CancellationSignal
 import android.util.Log
 import org.json.JSONArray
@@ -1711,102 +1712,116 @@ object Tools {
         }
     )
 
-    private const val WEATHER_TIMEOUT_SEC = 12
-
     private fun weatherReport(ctx: Context?, location: String, days: Int): String {
-        val query: String
-        // wttr.in 的 nearest_area 给的是罗马字("Guangdong" "Sandong"),念出来不像人话。
-        // 走设备定位时顺手用系统 Geocoder 反查一个中文地名顶上去。
-        var displayName: String? = null
-        if (location.isNotBlank()) {
-            query = location
-        } else {
-            if (ctx == null) return "error: 没有 Context，取不到设备位置；可以让用户说个城市名再查。"
-            val loc = deviceLocation(ctx, false)
-                ?: return "error: 没填 location，又拿不到设备位置" +
-                        "（定位服务可能关着）。可以让用户说个城市名再查。"
-            displayName = placeName(ctx, loc)
-            // 给 wttr.in 经纬度而不是地名:免得地名歧义,也免得再绕一次地名解析
-            query = String.format(Locale.US, "%.4f,%.4f", loc.latitude, loc.longitude)
-        }
-        // 城市名可能是中文,必须百分号编码后再进 URL;整个 URL 再用单引号包给 shell
-        val url = "https://wttr.in/" + URLEncoder.encode(query, "UTF-8") +
-                "?format=j1&lang=zh-cn"
-        // 25KB 左右的 JSON,必须放大 limit —— 默认 6000 会在解析之前就把它截断
-        val raw = sh(
-            "curl -s --max-time $WEATHER_TIMEOUT_SEC ${shellQuote(url)}",
-            limit = 256 * 1024
-        )
-        val json = try {
-            JSONObject(raw)
-        } catch (t: Throwable) {
-            // wttr.in 查不到地名时回的是纯文本("Unknown location"),不是 JSON
-            return "error: 天气服务没返回可用数据: ${raw.take(200)}"
-        }
-
-        val sb = StringBuilder()
-        val area = json.optJSONArray("nearest_area")?.optJSONObject(0)
-        val fallbackPlace = listOfNotNull(area?.wttrValue("areaName"), area?.wttrValue("region"))
-            .distinct()
-            .joinToString("，")
-        sb.append(displayName ?: fallbackPlace.ifBlank { query }).append('\n')
-
-        json.optJSONArray("current_condition")?.optJSONObject(0)?.let { c ->
-            sb.append("现在 ").append(c.optString("temp_C")).append("°C")
-            val feels = c.optString("FeelsLikeC")
-            if (feels.isNotBlank() && feels != c.optString("temp_C")) {
-                sb.append("（体感 ").append(feels).append("°C）")
-            }
-            sb.append("，").append(c.desc())
-            sb.append("，湿度 ").append(c.optString("humidity")).append('%')
-            sb.append("，风 ").append(c.optString("windspeedKmph")).append("km/h")
-            sb.append('\n')
-        }
-
-        val list = json.optJSONArray("weather")
-        for (i in 0 until minOf(days, list?.length() ?: 0)) {
-            val d = list!!.optJSONObject(i) ?: continue
-            sb.append(
-                when (i) {
-                    0 -> "今天"
-                    1 -> "明天"
-                    else -> "后天"
-                }
-            ).append('(').append(d.optString("date")).append(") ")
-            sb.append(d.optString("mintempC")).append('~').append(d.optString("maxtempC")).append("°C")
-            // 白天的天气用中午那条(hourly 每 3 小时一条,下标 4 = 12:00),
-            // 比拿 hourly[0](凌晨 0 点)有代表性得多
-            val hourly = d.optJSONArray("hourly")
-            hourly?.optJSONObject(4)?.let { sb.append("，").append(it.desc()) }
-            // 降水概率取全天最大值:白天不下但夜里下,照样得提醒带伞
-            var maxRain = 0
-            for (h in 0 until (hourly?.length() ?: 0)) {
-                maxRain = maxOf(maxRain, hourly!!.optJSONObject(h)?.optString("chanceofrain")?.toIntOrNull() ?: 0)
-            }
-            if (maxRain > 0) sb.append("，降水概率 ").append(maxRain).append('%')
-            d.optJSONArray("astronomy")?.optJSONObject(0)?.let {
-                sb.append("，日出 ").append(it.optString("sunrise"))
-                    .append(" 日落 ").append(it.optString("sunset"))
-            }
-            sb.append('\n')
-        }
-        return sb.toString().trimEnd()
+        if (ctx == null) return "error: 没有 Context，无法查询系统天气。"
+        return xiaomiWeatherReport(ctx, days)
+            ?: "error: 查询小米系统天气失败，未能获取到天气数据。"
     }
 
     /**
-     * wttr.in 的 j1 把每个文本字段都包成 `[{"value": "..."}]`,取值的样板代码太啰嗦,
-     * 这里收口成一个扩展函数。
+     * 从小米系统原生天气 ContentProvider (content://weather/actualWeatherData/1) 查询天气
+     * 文档参考: https://zhuti.designer.xiaomi.com/docs/blog/weatherApi.html
      */
-    private fun JSONObject.wttrValue(key: String): String? =
-        optJSONArray(key)?.optJSONObject(0)?.optString("value")?.takeIf { it.isNotBlank() }
+    private fun xiaomiWeatherReport(ctx: Context, days: Int): String? {
+        return try {
+            val uri = Uri.parse("content://weather/actualWeatherData/1")
+            val cursor = ctx.contentResolver.query(uri, null, null, null, null) ?: return null
+            cursor.use { c ->
+                if (!c.moveToFirst()) return null
 
-    /**
-     * 天气描述。优先中文(`lang=zh-cn` 时字段名就叫 `lang_zh-cn`),
-     * 没有就退回英文 —— 模型自己会把 "Light rain shower" 说成"小阵雨",
-     * 为这个让工具失败不值得。
-     */
-    private fun JSONObject.desc(): String =
-        wttrValue("lang_zh-cn") ?: wttrValue("weatherDesc") ?: "未知"
+                val cityNameIdx = c.getColumnIndex("city_name")
+                val tempIdx = c.getColumnIndex("temperature")
+                val descIdx = c.getColumnIndex("description")
+                val humidityIdx = c.getColumnIndex("humidity")
+                val windIdx = c.getColumnIndex("wind")
+                val aqiIdx = c.getColumnIndex("aqilevel")
+                val sunriseIdx = c.getColumnIndex("sunrise")
+                val sunsetIdx = c.getColumnIndex("sunset")
+
+                val cityName = if (cityNameIdx != -1) c.getString(cityNameIdx) else null
+                val temp = if (tempIdx != -1) c.getString(tempIdx) else null
+                val desc = if (descIdx != -1) c.getString(descIdx) else null
+
+                if (cityName.isNullOrBlank() && temp.isNullOrBlank()) return null
+
+                val sb = StringBuilder()
+                sb.append(cityName ?: "当前位置").append('\n')
+
+                sb.append("现在 ").append(temp?.let { if (it.endsWith("℃")) it else "${it}°C" } ?: "")
+                if (!desc.isNullOrBlank()) sb.append("，").append(desc)
+
+                if (humidityIdx != -1) {
+                    val h = c.getString(humidityIdx)
+                    if (!h.isNullOrBlank()) sb.append("，湿度 ").append(if (h.endsWith("%")) h else "${h}%")
+                }
+                if (windIdx != -1) {
+                    val w = c.getString(windIdx)
+                    if (!w.isNullOrBlank()) sb.append("，").append(w)
+                }
+                if (aqiIdx != -1) {
+                    val aqi = c.getString(aqiIdx)
+                    if (!aqi.isNullOrBlank() && aqi != "0") sb.append("，AQI ").append(aqi)
+                }
+                sb.append('\n')
+
+                val dayIdx = c.getColumnIndex("day")
+                val tmphighsIdx = c.getColumnIndex("tmphighs")
+                val tmplowsIdx = c.getColumnIndex("tmplows")
+                val weatherFromIdx = c.getColumnIndex("weathernamesfrom")
+
+                var dayCount = 0
+                do {
+                    val dayOffset = if (dayIdx != -1) c.getInt(dayIdx) else (dayCount + 1)
+                    if (dayOffset in 1..days) {
+                        val dayLabel = when (dayOffset) {
+                            1 -> "今天"
+                            2 -> "明天"
+                            3 -> "后天"
+                            else -> "第${dayOffset}天"
+                        }
+                        val high = if (tmphighsIdx != -1) c.getString(tmphighsIdx) else null
+                        val low = if (tmplowsIdx != -1) c.getString(tmplowsIdx) else null
+                        val wName = if (weatherFromIdx != -1) c.getString(weatherFromIdx) else null
+
+                        if (!high.isNullOrBlank() || !low.isNullOrBlank()) {
+                            sb.append(dayLabel)
+                            if (!low.isNullOrBlank() && !high.isNullOrBlank()) {
+                                val cleanLow = low.replace("℃", "")
+                                val cleanHigh = high.replace("℃", "")
+                                sb.append(" ").append(cleanLow).append("~").append(cleanHigh).append("°C")
+                            } else if (!high.isNullOrBlank()) {
+                                sb.append(" 最高 ").append(high)
+                            }
+                            if (!wName.isNullOrBlank()) {
+                                sb.append("，").append(wName)
+                            }
+                            sb.append('\n')
+                            dayCount++
+                        }
+                    }
+                } while (c.moveToNext() && dayCount < days)
+
+                if (sunriseIdx != -1 && sunsetIdx != -1) {
+                    val srMs = c.getLong(sunriseIdx)
+                    val ssMs = c.getLong(sunsetIdx)
+                    if (srMs > 0 && ssMs > 0) {
+                        val formatTime = { ms: Long ->
+                            val totalSec = ms / 1000
+                            val hours = (totalSec / 3600) % 24
+                            val mins = (totalSec % 3600) / 60
+                            String.format(Locale.US, "%02d:%02d", hours, mins)
+                        }
+                        sb.append("日出 ").append(formatTime(srMs)).append(" 日落 ").append(formatTime(ssMs))
+                    }
+                }
+
+                sb.toString().trimEnd()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "xiaomiWeatherReport failed", t)
+            null
+        }
+    }
 
     /** 反查地名的等待上限。 */
     private const val GEOCODE_WAIT_SEC = 3L
